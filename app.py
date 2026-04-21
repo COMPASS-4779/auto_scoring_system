@@ -1,4 +1,6 @@
 import streamlit as st
+st.write("🔍 現在読み込めている鍵の一覧:", list(st.secrets.keys()))
+st.stop()
 import os
 import datetime
 import json
