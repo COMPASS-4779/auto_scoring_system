@@ -21,21 +21,22 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 
 # ==========================================
-# 🌟 設定情報
+# 🌟 設定情報（セキュリティ強化版）
 # ==========================================
 try:
     GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
     SENDER_EMAIL = st.secrets["SENDER_EMAIL"]
     APP_PASSWORD = st.secrets["APP_PASSWORD"]
+    # 🌟 ファイルではなくSecretsから合鍵を読み込む
+    GOOGLE_TOKEN_JSON_STR = st.secrets["GOOGLE_TOKEN_JSON"]
+    GOOGLE_TOKEN_DICT = json.loads(GOOGLE_TOKEN_JSON_STR)
 except KeyError:
-    st.error("設定情報が不足しています。.streamlit/secrets.toml を確認してください。")
+    st.error("設定情報が不足しています。StreamlitのSecrets設定を確認してください。")
     st.stop()
 
 SPREADSHEET_ID = "1B8BKKY8SfR-V3ysirsNG6fqlrVzXqPBF_AdjFDc5fCc"
 PARENT_FOLDER_ID = "1DS7anMs-ruhTtVxZNqsVhZSbeQFCww_2"
 MASTER_DIR = "master_texts"
-
-# 🌟 変更：通知先も新しいアドレスに変更
 NOTIFICATION_EMAIL = "info@compassesonline.com"
 
 STUDENT_LIST = ["上原百華", "上原遥人", "浅井渉", "荒木陽向", "谷川瑠依", "momokauehara"]
@@ -47,7 +48,6 @@ os.makedirs(MASTER_DIR, exist_ok=True)
 
 def send_notification_email_plan_b(subject, body):
     try:
-        # 🌟 テストで成功した「日本語安全仕様（UTF-8）」を適用！
         msg = MIMEText(body, "plain", "utf-8")
         msg['Subject'] = Header(subject, "utf-8")
         msg['From'] = SENDER_EMAIL
@@ -121,9 +121,10 @@ def process_master_file_from_path(filepath, client):
         if ai_file.state.name == 'ACTIVE': ai_files.append(ai_file)
     return ai_files
 
-def background_processing_task(student_name, subject_name, text_name, selected_master_path, photos_data, api_key):
+def background_processing_task(student_name, subject_name, text_name, selected_master_path, photos_data, api_key, token_dict):
     try:
-        creds = Credentials.from_authorized_user_file('token.json')
+        # 🌟 ファイルの代わりに渡されたデータから権限を作成
+        creds = Credentials.from_authorized_user_info(token_dict)
         client = genai.Client(api_key=api_key)
         folder_id = get_drive_folder_id(student_name, creds)
         
@@ -200,13 +201,13 @@ with col_left:
                 with open(tmp_filepath, "wb") as f: f.write(photo.getvalue())
                 photos_data.append((tmp_filepath, photo.name))
             
-            threading.Thread(target=background_processing_task, args=(student_name, subject_name, text_name, selected_master_path, photos_data, GEMINI_API_KEY)).start()
+            threading.Thread(target=background_processing_task, args=(student_name, subject_name, text_name, selected_master_path, photos_data, GEMINI_API_KEY, GOOGLE_TOKEN_DICT)).start()
             st.success("✅ 受付完了！画面を閉じてOKです。進捗はメールで通知されます。")
             st.balloons()
 
 with col_right:
     st.subheader("📊 現在の集計結果")
     if st.button("🔄 データを更新"): st.rerun()
-    df = get_spreadsheet_data(Credentials.from_authorized_user_file('token.json'))
+    df = get_spreadsheet_data(Credentials.from_authorized_user_info(GOOGLE_TOKEN_DICT))
     if not df.empty:
         st.dataframe(df.iloc[::-1], height=600, width='stretch', column_config={"写真リンク": st.column_config.LinkColumn("写真リンク", display_text="リンクを開く")})
