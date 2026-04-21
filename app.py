@@ -21,17 +21,33 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 
 # ==========================================
-# 🌟 設定情報（セキュリティ強化版）
+# 🌟 設定情報（原因特定・強化版）
 # ==========================================
+st.set_page_config(page_title="AI集計システム", layout="wide")
+
+# 足りない鍵を具体的にチェックする機能
+missing_keys = []
+for key in ["GEMINI_API_KEY", "SENDER_EMAIL", "APP_PASSWORD", "GOOGLE_TOKEN_JSON"]:
+    if key not in st.secrets:
+        missing_keys.append(key)
+
+if missing_keys:
+    st.error(f"🚨 金庫（Secrets）の中に以下の鍵が見つかりません: {', '.join(missing_keys)}")
+    st.info("Streamlit右下の「Manage app」 > 「Settings」 > 「Secrets」を開き、名前や入力形式を確認してください。")
+    st.stop()
+
 try:
     GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
     SENDER_EMAIL = st.secrets["SENDER_EMAIL"]
     APP_PASSWORD = st.secrets["APP_PASSWORD"]
-    # 🌟 ファイルではなくSecretsから合鍵を読み込む
     GOOGLE_TOKEN_JSON_STR = st.secrets["GOOGLE_TOKEN_JSON"]
+    # 🌟 token.jsonの文字が崩れていないかチェック
     GOOGLE_TOKEN_DICT = json.loads(GOOGLE_TOKEN_JSON_STR)
-except KeyError:
-    st.error("設定情報が不足しています。StreamlitのSecrets設定を確認してください。")
+except json.JSONDecodeError as e:
+    st.error(f"🚨 token.json の読み込みに失敗しました。貼り付けた中身が途中で途切れているか、余計な文字が入っている可能性があります。\n詳細エラー: {e}")
+    st.stop()
+except Exception as e:
+    st.error(f"🚨 予期せぬエラー: {e}")
     st.stop()
 
 SPREADSHEET_ID = "1B8BKKY8SfR-V3ysirsNG6fqlrVzXqPBF_AdjFDc5fCc"
@@ -123,7 +139,6 @@ def process_master_file_from_path(filepath, client):
 
 def background_processing_task(student_name, subject_name, text_name, selected_master_path, photos_data, api_key, token_dict):
     try:
-        # 🌟 ファイルの代わりに渡されたデータから権限を作成
         creds = Credentials.from_authorized_user_info(token_dict)
         client = genai.Client(api_key=api_key)
         folder_id = get_drive_folder_id(student_name, creds)
@@ -165,7 +180,6 @@ def background_processing_task(student_name, subject_name, text_name, selected_m
 # ==========================================
 # 🌟 Streamlit Web UI
 # ==========================================
-st.set_page_config(page_title="AI集計システム", layout="wide")
 st.title("📝 採点済みプリント 自動集計システム")
 
 col_left, col_right = st.columns([1, 1])
