@@ -183,7 +183,7 @@ def background_processing_task(student_name, subject_name, text_name, selected_m
                     )
                     contents = [ai_photo, prompt]
 
-                response = client.models.generate_content(model='gemini-2.5-flash-preview-04-17', contents=contents)
+                response = client.models.generate_content(model='gemini-2.0-flash', contents=contents)
                 match = re.search(r'\[.*\]', response.text, re.DOTALL)
                 section_results = json.loads(match.group(0)) if match else []
                 save_to_spreadsheet(student_name, subject_name, text_name, section_results, drive_link, creds)
