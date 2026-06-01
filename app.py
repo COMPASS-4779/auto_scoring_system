@@ -148,7 +148,7 @@ def process_master_file_from_path(filepath, client):
 def background_processing_task(student_name, subject_name, text_name, selected_master_path, photos_data, api_key, token_dict):
     try:
         creds = Credentials.from_authorized_user_info(token_dict)
-        client = genai.Client(api_key=api_key)
+        client = genai.Client(api_key=api_key, http_options={'api_version': 'v1alpha'})
         folder_id = get_drive_folder_id(student_name, creds)
         
         send_notification_email_plan_b("【進捗】AI集計システム 処理開始", f"生徒: {student_name} さんの処理を開始しました。")
