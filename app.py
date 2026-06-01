@@ -91,16 +91,24 @@ def upload_to_drive(filepath, filename, folder_id, creds):
     file = service.files().create(body={'name': filename, 'parents': [folder_id]}, media_body=media, fields='webViewLink').execute()
     return file.get('webViewLink')
 
-def save_to_spreadsheet(student_name, subject, text_name, wrong_problems, drive_link, creds):
+def save_to_spreadsheet(student_name, subject, text_name, section_results, drive_link, creds):
     service = build('sheets', 'v4', credentials=creds)
     now = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     values = []
-    if not isinstance(wrong_problems, list): wrong_problems = [wrong_problems]
-    for p in wrong_problems:
-        if isinstance(p, dict):
-            values.append([now, student_name, subject, text_name, p.get('page','-'), p.get('chapter','-'), p.get('section','-'), p.get('number','-'), drive_link])
+    for s in section_results:
+        chapter = s.get('chapter', '-')
+        section = s.get('section', '-')
+        total   = s.get('total', 0)
+        wrong   = s.get('wrong', [])
+        if wrong:
+            for p in wrong:
+                values.append([now, student_name, subject, text_name,
+                               p.get('page', '-'), chapter, section,
+                               p.get('number', '-'), drive_link, total])
         else:
-            values.append([now, student_name, subject, text_name, '-', '-', '-', str(p), drive_link])
+            # 全問正解の節も1行記録（総問題数を保持するため）
+            values.append([now, student_name, subject, text_name,
+                          '-', chapter, section, '', drive_link, total])
     if values:
         service.spreadsheets().values().append(
             spreadsheetId=SPREADSHEET_ID, range='A1',
@@ -110,7 +118,7 @@ def save_to_spreadsheet(student_name, subject, text_name, wrong_problems, drive_
 def get_spreadsheet_data(creds):
     try:
         service = build('sheets', 'v4', credentials=creds)
-        result = service.spreadsheets().values().get(spreadsheetId=SPREADSHEET_ID, range='A:I').execute()
+        result = service.spreadsheets().values().get(spreadsheetId=SPREADSHEET_ID, range='A:J').execute()
         rows = result.get('values', [])
         if not rows: return pd.DataFrame()
         return pd.DataFrame(rows[1:], columns=rows[0])
@@ -156,18 +164,31 @@ def background_processing_task(student_name, subject_name, text_name, selected_m
                 while ai_photo.state.name == 'PROCESSING': time.sleep(1); ai_photo = client.files.get(name=ai_photo.name)
                 
                 if ai_master_files:
-                    prompt = "マスターと比較して間違っている問題を抽出してJSONで返してください。\n[{\"page\": \"12\", \"chapter\": \"第1章\", \"section\": \"五感（3）聴覚\", \"number\": \"問2\"}]"
+                    prompt = (
+                        "マスターと比較して、節（section）ごとに総問題数と間違い問題をJSONで返してください。\n"
+                        "全問正解の節も必ず含めてください。wrongが空配列の場合は全問正解です。\n"
+                        "形式:\n"
+                        "[{\"chapter\": \"第1章\", \"section\": \"五感（3）聴覚\", \"total\": 5, "
+                        "\"wrong\": [{\"page\": \"12\", \"number\": \"問2\"}]}]"
+                    )
                     contents = ai_master_files + [ai_photo, prompt]
                 else:
-                    prompt = "写真だけを見て間違っている問題をJSONで返してください。章は単元名、節は詳細項目、番号は1⃣（1）形式にしてください。\n[{\"page\": \"-\", \"chapter\": \"植物\", \"section\": \"光合成\", \"number\": \"1⃣（1）\"}]"
+                    prompt = (
+                        "写真だけを見て、節（section）ごとに総問題数と間違い問題をJSONで返してください。\n"
+                        "章は単元名、節は詳細項目、番号は1⃣（1）形式にしてください。\n"
+                        "全問正解の節も必ず含めてください。wrongが空配列の場合は全問正解です。\n"
+                        "形式:\n"
+                        "[{\"chapter\": \"植物\", \"section\": \"光合成\", \"total\": 5, "
+                        "\"wrong\": [{\"page\": \"-\", \"number\": \"1⃣（1）\"}]}]"
+                    )
                     contents = [ai_photo, prompt]
 
-                response = client.models.generate_content(model='gemini-3.1-pro-preview', contents=contents)
+                response = client.models.generate_content(model='gemini-2.5-pro-preview-06-05', contents=contents)
                 match = re.search(r'\[.*\]', response.text, re.DOTALL)
-                wrong_problems = json.loads(match.group(0)) if match else []
-                save_to_spreadsheet(student_name, subject_name, text_name, wrong_problems, drive_link, creds)
-                
-                result_text = json.dumps(wrong_problems, ensure_ascii=False, indent=2)
+                section_results = json.loads(match.group(0)) if match else []
+                save_to_spreadsheet(student_name, subject_name, text_name, section_results, drive_link, creds)
+
+                result_text = json.dumps(section_results, ensure_ascii=False, indent=2)
                 send_notification_email_plan_b(f"【進捗】写真記録完了 ({photo_name})", f"解析完了:\n{result_text}\n\nリンク: {drive_link}")
             finally:
                 try: os.remove(photo_filepath)
