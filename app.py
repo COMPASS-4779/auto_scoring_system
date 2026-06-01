@@ -105,10 +105,7 @@ def save_to_spreadsheet(student_name, subject, text_name, section_results, drive
                 values.append([now, student_name, subject, text_name,
                                p.get('page', '-'), chapter, section,
                                p.get('number', '-'), drive_link, total])
-        else:
-            # 全問正解の節も1行記録（総問題数を保持するため）
-            values.append([now, student_name, subject, text_name,
-                          '-', chapter, section, '', drive_link, total])
+        # 全問正解の節はスプレッドシートに保存しない（要復習リスト不要のため）
     if values:
         service.spreadsheets().values().append(
             spreadsheetId=SPREADSHEET_ID, range='A1',
