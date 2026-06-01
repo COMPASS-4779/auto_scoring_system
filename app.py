@@ -180,33 +180,33 @@ def background_processing_task(student_name, subject_name, text_name, selected_m
                 ai_photo = client.files.upload(file=photo_filepath)
                 while ai_photo.state.name == 'PROCESSING': time.sleep(1); ai_photo = client.files.get(name=ai_photo.name)
                 
+                common_rules = (
+                    "【重要な判断基準】\n"
+                    "・×や✗がついている問題、赤ペンで訂正されている問題 = 間違い\n"
+                    "・○がついている問題、何も印がない問題 = 正解（wrongに含めない）\n"
+                    "・計算の途中式や答えの数値（例: -8, 3/4 など）は問題番号ではない\n"
+                    "・問題番号は「1」「(2)」「問3」のような番号表記のみ\n\n"
+                    f"【出力形式】\n"
+                    f"chapterは常に \"{text_name}\" を使用してください。\n"
+                    "sectionは写真から判断した項目内容（例: 文字式の表現、正負の数の計算）。\n"
+                    "totalはそのsectionの総問題数。\n"
+                    "wrongは間違えた問題のみ。\n\n"
+                    "[{\"chapter\": \"" + text_name + "\", \"section\": \"項目名\", \"total\": 4, "
+                    "\"wrong\": [{\"page\": \"-\", \"number\": \"(1)\"}]}]"
+                )
+
                 if ai_master_files:
                     prompt = (
                         "採点済みの生徒の答案写真とマスター（正解）を比較してください。\n"
-                        "節（section）ごとに総問題数と間違い問題をJSONで返してください。\n\n"
-                        "【重要な判断基準】\n"
-                        "・×や✗がついている問題、赤ペンで訂正されている問題 = 間違い\n"
-                        "・○がついている問題、何も印がない問題 = 正解（wrongに含めない）\n"
-                        "・計算の途中式や答えの数値（例: -8, 3/4 など）は問題番号ではない\n"
-                        "・問題番号は「1」「(2)」「問3」のような番号表記のみ\n\n"
-                        "形式:\n"
-                        "[{\"chapter\": \"第1章\", \"section\": \"五感（3）聴覚\", \"total\": 5, "
-                        "\"wrong\": [{\"page\": \"12\", \"number\": \"問2\"}]}]"
+                        "sectionごとに総問題数と間違い問題をJSONで返してください。\n\n"
+                        + common_rules
                     )
                     contents = ai_master_files + [ai_photo, prompt]
                 else:
                     prompt = (
                         "採点済みの答案写真を見てください。\n"
-                        "節（section）ごとに総問題数と間違い問題をJSONで返してください。\n\n"
-                        "【重要な判断基準】\n"
-                        "・×や✗がついている問題、赤ペンで訂正されている問題 = 間違い\n"
-                        "・○がついている問題、何も印がない問題 = 正解（wrongに含めない）\n"
-                        "・計算の途中式や答えの数値（例: -8, 3/4 など）は問題番号ではない\n"
-                        "・問題番号は「1」「(2)」「問3」のような番号表記のみ\n"
-                        "・章は単元名、節は詳細項目\n\n"
-                        "形式:\n"
-                        "[{\"chapter\": \"植物\", \"section\": \"光合成\", \"total\": 5, "
-                        "\"wrong\": [{\"page\": \"-\", \"number\": \"(1)\"}]}]"
+                        "sectionごとに総問題数と間違い問題をJSONで返してください。\n\n"
+                        + common_rules
                     )
                     contents = [ai_photo, prompt]
 
