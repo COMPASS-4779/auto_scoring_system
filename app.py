@@ -145,13 +145,33 @@ def process_master_file_from_path(filepath, client):
         if ai_file.state.name == 'ACTIVE': ai_files.append(ai_file)
     return ai_files
 
+def get_best_model(client):
+    """利用可能なモデルから最新のものを選択する"""
+    preferred = [
+        'gemini-2.5-flash-preview-05-20',
+        'gemini-2.5-pro-exp-03-25',
+        'gemini-2.5-flash',
+        'gemini-2.5-pro',
+        'gemini-1.5-pro-latest',
+        'gemini-1.5-pro',
+    ]
+    try:
+        available = [m.name.replace('models/', '') for m in client.models.list()]
+        for model in preferred:
+            if model in available:
+                return model
+    except Exception:
+        pass
+    return 'gemini-1.5-pro'
+
 def background_processing_task(student_name, subject_name, text_name, selected_master_path, photos_data, api_key, token_dict):
     try:
         creds = Credentials.from_authorized_user_info(token_dict)
-        client = genai.Client(api_key=api_key, http_options={'api_version': 'v1alpha'})
+        client = genai.Client(api_key=api_key)
         folder_id = get_drive_folder_id(student_name, creds)
-        
-        send_notification_email_plan_b("【進捗】AI集計システム 処理開始", f"生徒: {student_name} さんの処理を開始しました。")
+
+        best_model = get_best_model(client)
+        send_notification_email_plan_b("【進捗】AI集計システム 処理開始", f"生徒: {student_name} さんの処理を開始しました。\n使用モデル: {best_model}")
 
         ai_master_files = []
         if selected_master_path:
@@ -183,7 +203,7 @@ def background_processing_task(student_name, subject_name, text_name, selected_m
                     )
                     contents = [ai_photo, prompt]
 
-                response = client.models.generate_content(model='gemini-2.5-flash-preview-05-20', contents=contents)
+                response = client.models.generate_content(model=best_model, contents=contents)
                 match = re.search(r'\[.*\]', response.text, re.DOTALL)
                 section_results = json.loads(match.group(0)) if match else []
                 save_to_spreadsheet(student_name, subject_name, text_name, section_results, drive_link, creds)
