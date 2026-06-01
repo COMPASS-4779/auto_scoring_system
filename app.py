@@ -182,8 +182,13 @@ def background_processing_task(student_name, subject_name, text_name, selected_m
                 
                 if ai_master_files:
                     prompt = (
-                        "マスターと比較して、節（section）ごとに総問題数と間違い問題をJSONで返してください。\n"
-                        "全問正解の節も必ず含めてください。wrongが空配列の場合は全問正解です。\n"
+                        "採点済みの生徒の答案写真とマスター（正解）を比較してください。\n"
+                        "節（section）ごとに総問題数と間違い問題をJSONで返してください。\n\n"
+                        "【重要な判断基準】\n"
+                        "・×や✗がついている問題、赤ペンで訂正されている問題 = 間違い\n"
+                        "・○がついている問題、何も印がない問題 = 正解（wrongに含めない）\n"
+                        "・計算の途中式や答えの数値（例: -8, 3/4 など）は問題番号ではない\n"
+                        "・問題番号は「1」「(2)」「問3」のような番号表記のみ\n\n"
                         "形式:\n"
                         "[{\"chapter\": \"第1章\", \"section\": \"五感（3）聴覚\", \"total\": 5, "
                         "\"wrong\": [{\"page\": \"12\", \"number\": \"問2\"}]}]"
@@ -191,12 +196,17 @@ def background_processing_task(student_name, subject_name, text_name, selected_m
                     contents = ai_master_files + [ai_photo, prompt]
                 else:
                     prompt = (
-                        "写真だけを見て、節（section）ごとに総問題数と間違い問題をJSONで返してください。\n"
-                        "章は単元名、節は詳細項目、番号は1⃣（1）形式にしてください。\n"
-                        "全問正解の節も必ず含めてください。wrongが空配列の場合は全問正解です。\n"
+                        "採点済みの答案写真を見てください。\n"
+                        "節（section）ごとに総問題数と間違い問題をJSONで返してください。\n\n"
+                        "【重要な判断基準】\n"
+                        "・×や✗がついている問題、赤ペンで訂正されている問題 = 間違い\n"
+                        "・○がついている問題、何も印がない問題 = 正解（wrongに含めない）\n"
+                        "・計算の途中式や答えの数値（例: -8, 3/4 など）は問題番号ではない\n"
+                        "・問題番号は「1」「(2)」「問3」のような番号表記のみ\n"
+                        "・章は単元名、節は詳細項目\n\n"
                         "形式:\n"
                         "[{\"chapter\": \"植物\", \"section\": \"光合成\", \"total\": 5, "
-                        "\"wrong\": [{\"page\": \"-\", \"number\": \"1⃣（1）\"}]}]"
+                        "\"wrong\": [{\"page\": \"-\", \"number\": \"(1)\"}]}]"
                     )
                     contents = [ai_photo, prompt]
 
