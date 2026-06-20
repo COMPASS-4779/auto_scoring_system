@@ -24,6 +24,7 @@ import streamlit as st
 import os
 import io
 import csv
+import zipfile
 import datetime
 import json
 import re
@@ -371,6 +372,41 @@ def background_processing_task(student_name, subject_name, text_name, selected_m
 
 
 # ==========================================
+# [統合] アップロード(画像/PDF/Word) → 画像群に展開
+# ==========================================
+def expand_uploaded_to_images(uploaded_file):
+    """画像/PDF/Word を Gemini に渡す画像の一時ファイル群に展開して [(path, name), ...] を返す。"""
+    name = uploaded_file.name
+    ext = name.rsplit('.', 1)[-1].lower() if '.' in name else ''
+    data = uploaded_file.getvalue()
+    out = []
+    try:
+        if ext in ('jpg', 'jpeg', 'png', 'bmp', 'webp', 'gif'):
+            tmp = os.path.join(tempfile.gettempdir(), f"photo_{uuid.uuid4().hex}.{ext if ext!='jpeg' else 'jpg'}")
+            with open(tmp, 'wb') as f: f.write(data)
+            out.append((tmp, name))
+        elif ext == 'pdf':
+            doc = fitz.open(stream=data, filetype="pdf")
+            for i in range(len(doc)):
+                pix = doc.load_page(i).get_pixmap(dpi=150)
+                tmp = os.path.join(tempfile.gettempdir(), f"photo_{uuid.uuid4().hex}.png")
+                pix.save(tmp)
+                out.append((tmp, f"{name}_p{i+1}"))
+        elif ext in ('docx', 'doc'):
+            z = zipfile.ZipFile(io.BytesIO(data))
+            media = [n for n in z.namelist()
+                     if n.startswith('word/media/') and n.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.gif'))]
+            for k, n in enumerate(media):
+                e = n.rsplit('.', 1)[-1].lower()
+                tmp = os.path.join(tempfile.gettempdir(), f"photo_{uuid.uuid4().hex}.{e}")
+                with open(tmp, 'wb') as f: f.write(z.read(n))
+                out.append((tmp, f"{name}_img{k+1}"))
+    except Exception as e:
+        print(f"展開エラー({name}): {e}")
+    return out
+
+
+# ==========================================
 # Streamlit Web UI
 # ==========================================
 st.title("📝 採点済みプリント 自動集計システム（逆引き統合版）")
@@ -420,23 +456,24 @@ with col_left:
             selected_master_path = os.path.join(MASTER_DIR, um.name)
             with open(selected_master_path, "wb") as f: f.write(um.getvalue())
 
-    uploaded_photos = st.file_uploader("採点済み写真", type=['jpg', 'jpeg', 'png'], accept_multiple_files=True)
+    uploaded_photos = st.file_uploader("採点済み写真／PDF／Word（複数可）", type=['jpg', 'jpeg', 'png', 'pdf', 'docx', 'doc'], accept_multiple_files=True)
 
     if st.button("🚀 送信して完了", type="primary"):
         if not student_name or not uploaded_photos or not text_name:
             st.error("生徒名・テキスト名・写真は必須です")
         else:
             photos_data = []
-            for photo in uploaded_photos:
-                tmp = os.path.join(tempfile.gettempdir(), f"photo_{uuid.uuid4().hex}.jpg")
-                with open(tmp, "wb") as f: f.write(photo.getvalue())
-                photos_data.append((tmp, photo.name))
-            threading.Thread(
-                target=background_processing_task,
-                args=(student_name, subject_name, text_name, selected_master_path, photos_data, GEMINI_API_KEY, GOOGLE_TOKEN_DICT, master_index)
-            ).start()
-            st.success("✅ 受付完了！進捗はメールで通知されます。")
-            st.balloons()
+            for up_file in uploaded_photos:
+                photos_data.extend(expand_uploaded_to_images(up_file))  # 画像/PDF/Word を画像群へ展開
+            if not photos_data:
+                st.error("画像を取り出せませんでした（PDF/Wordに画像が含まれていない可能性があります）。")
+            else:
+                threading.Thread(
+                    target=background_processing_task,
+                    args=(student_name, subject_name, text_name, selected_master_path, photos_data, GEMINI_API_KEY, GOOGLE_TOKEN_DICT, master_index)
+                ).start()
+                st.success(f"✅ 受付完了！（{len(photos_data)} 枚の画像を処理します）進捗はメールで通知されます。")
+                st.balloons()
 
 with col_right:
     st.subheader("📊 現在の集計結果")
