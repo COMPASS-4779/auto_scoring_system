@@ -76,6 +76,9 @@ MASTER_DIR = "master_texts"
 NOTIFICATION_EMAIL = "info@compassesonline.com"
 MASTER_TAB = "目次マスタ"  # [統合] テキスト目次マスタを保存するタブ名
 MASTER_HEADER = ["テキスト名", "章", "節", "節タイトル", "開始ページ", "終了ページ"]
+STUDENT_TAB = "生徒名簿"   # [統合] 生徒名を保存するタブ
+SUBJECT_TAB = "科目マスタ"  # [統合] 科目を保存するタブ
+DEFAULT_SUBJECTS = ["国語", "数学", "英語", "英文法", "古文", "理科", "社会"]
 
 STUDENT_LIST = ["上原百華", "上原遥人", "浅井渉", "荒木陽向", "谷川瑠依", "momokauehara"]
 os.makedirs(MASTER_DIR, exist_ok=True)
@@ -203,6 +206,61 @@ def lookup_section(index, text_name, page):
         if r["start"] is not None and r["end"] is not None and r["start"] <= p <= r["end"]:
             return (r["chapter"], r["section"], r["title"])
     return ("", "", "")
+
+
+# ==========================================
+# [統合] 生徒名・科目（単一列タブ）の管理
+# ==========================================
+def ensure_list_tab(creds, tab, header_label, seed=None):
+    svc = _sheets(creds)
+    meta = svc.spreadsheets().get(spreadsheetId=SPREADSHEET_ID).execute()
+    titles = [s['properties']['title'] for s in meta.get('sheets', [])]
+    if tab not in titles:
+        svc.spreadsheets().batchUpdate(
+            spreadsheetId=SPREADSHEET_ID,
+            body={"requests": [{"addSheet": {"properties": {"title": tab}}}]}).execute()
+        vals = [[header_label]] + [[s] for s in (seed or [])]
+        svc.spreadsheets().values().update(
+            spreadsheetId=SPREADSHEET_ID, range=f"{tab}!A1",
+            valueInputOption="RAW", body={"values": vals}).execute()
+
+def load_list(creds, tab, header_label, seed=None):
+    try:
+        ensure_list_tab(creds, tab, header_label, seed)
+        res = _sheets(creds).spreadsheets().values().get(
+            spreadsheetId=SPREADSHEET_ID, range=f"{tab}!A:A").execute()
+        rows = res.get('values', [])
+        out = []
+        for r in rows[1:]:
+            v = (r[0].strip() if r and r[0] is not None else "")
+            if v and v not in out:
+                out.append(v)
+        return out
+    except Exception as e:
+        print(f"[統合] load_list error ({tab}): {e}")
+        return list(seed or [])
+
+def add_list_item(creds, tab, header_label, value):
+    value = (value or "").strip()
+    if not value:
+        return False
+    cur = load_list(creds, tab, header_label)
+    if value in cur:
+        return False
+    _sheets(creds).spreadsheets().values().append(
+        spreadsheetId=SPREADSHEET_ID, range=f"{tab}!A:A",
+        valueInputOption="RAW", body={"values": [[value]]}).execute()
+    return True
+
+def remove_list_item(creds, tab, header_label, value):
+    cur = load_list(creds, tab, header_label)
+    new = [x for x in cur if x != value]
+    _sheets(creds).spreadsheets().values().clear(
+        spreadsheetId=SPREADSHEET_ID, range=f"{tab}!A:A").execute()
+    _sheets(creds).spreadsheets().values().update(
+        spreadsheetId=SPREADSHEET_ID, range=f"{tab}!A1",
+        valueInputOption="RAW", body={"values": [[header_label]] + [[x] for x in new]}).execute()
+    return True
 
 
 # ==========================================
@@ -413,6 +471,8 @@ st.title("📝 採点済みプリント 自動集計システム（逆引き統�
 
 creds_ui = Credentials.from_authorized_user_info(GOOGLE_TOKEN_DICT)
 master_index = load_master_index(creds_ui)  # [統合] Sheetから常時参照
+students = load_list(creds_ui, STUDENT_TAB, "生徒名", STUDENT_LIST)   # [統合] 生徒名簿
+subjects = load_list(creds_ui, SUBJECT_TAB, "科目", DEFAULT_SUBJECTS)  # [統合] 科目マスタ
 
 # ---- サイドバー：テキスト目次マスタ管理 ----
 with st.sidebar:
@@ -430,12 +490,37 @@ with st.sidebar:
         except Exception as e:
             st.error(f"登録エラー: {e}")
 
+    st.divider()
+    st.subheader("👤 生徒名の管理")
+    ns = st.text_input("生徒名を追加", key="new_student")
+    if st.button("➕ 生徒を追加"):
+        if add_list_item(creds_ui, STUDENT_TAB, "生徒名", ns):
+            st.success("追加しました"); st.rerun()
+        else:
+            st.warning("空欄、または既に登録済みです")
+    ds = st.selectbox("削除する生徒", options=["（選択）"] + students, key="del_student")
+    if st.button("🗑 生徒を削除") and ds and ds != "（選択）":
+        remove_list_item(creds_ui, STUDENT_TAB, "生徒名", ds); st.success("削除しました"); st.rerun()
+
+    st.divider()
+    st.subheader("📕 科目の管理")
+    nsub = st.text_input("科目を追加", key="new_subject")
+    if st.button("➕ 科目を追加"):
+        if add_list_item(creds_ui, SUBJECT_TAB, "科目", nsub):
+            st.success("追加しました"); st.rerun()
+        else:
+            st.warning("空欄、または既に登録済みです")
+    dsub = st.selectbox("削除する科目", options=["（選択）"] + subjects, key="del_subject")
+    if st.button("🗑 科目を削除") and dsub and dsub != "（選択）":
+        remove_list_item(creds_ui, SUBJECT_TAB, "科目", dsub); st.success("削除しました"); st.rerun()
+
 col_left, col_right = st.columns([1, 1])
 
 with col_left:
     st.subheader("👤 講師用アップロード画面")
-    student_name = st.selectbox("生徒名", options=STUDENT_LIST, index=None)
-    subject_name = st.text_input("科目")
+    student_name = st.selectbox("生徒名", options=students, index=None)
+    subj_pick = st.selectbox("科目", options=subjects + ["（手入力）"], index=None)
+    subject_name = st.text_input("科目（手入力）") if subj_pick == "（手入力）" else (subj_pick or "")
     # [統合] テキスト名は登録済みマスタから選択可（手入力も可）
     text_options = list(master_index.keys())
     if text_options:
