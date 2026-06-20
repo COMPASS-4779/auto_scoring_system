@@ -88,7 +88,8 @@ os.makedirs(MASTER_DIR, exist_ok=True)
 # [統合] テキスト目次マスタ（Google Sheet 永続化）
 # ==========================================
 def _to_int(v):
-    m = re.search(r"\d+", str(v)) if v is not None else None
+    if v is None: return None
+    m = re.search(r"\d+", str(v).translate(str.maketrans("０１２３４５６７８９", "0123456789")))
     return int(m.group()) if m else None
 
 def _sheets(creds):
@@ -262,6 +263,283 @@ def remove_list_item(creds, tab, header_label, value):
         valueInputOption="RAW", body={"values": [[header_label]] + [[x] for x in new]}).execute()
     return True
 
+
+
+
+# ==========================================
+# [統合] PDF目次解析（逆引きアプリのPython移植 / PyMuPDF）
+# ==========================================
+ZEN = "０１２３４５６７８９"
+KAN = "〇一二三四五六七八九"
+
+def _half(s): return str(s).translate(str.maketrans(ZEN, "0123456789"))
+def _has_jp(s): return bool(re.search(r"[ぁ-んァ-ヶ一-龥]", s or ""))
+def _parse_num(s):
+    t = re.sub(r"[^\d]", "", _half(str(s)))
+    if not t: return None
+    n = int(t)
+    return n if 1 <= n <= 1999 else None
+def _kan2num(s):
+    s = _half(s)
+    if s.isdigit(): return int(s)
+    if s == "十": return 10
+    m = re.match(r"^(.?)十(.?)$", s)
+    if m:
+        t = KAN.find(m.group(1)) if m.group(1) else 1
+        o = KAN.find(m.group(2)) if m.group(2) else 0
+        if t < 0: t = 1
+        if o < 0: o = 0
+        return t*10+o
+    i = KAN.find(s)
+    return i if i > 0 else None
+
+def _page_spans(page):
+    out = []
+    for b in page.get_text("dict")["blocks"]:
+        for l in b.get("lines", []):
+            for sp in l.get("spans", []):
+                t = sp["text"]
+                if t and t.strip():
+                    x0, y0, x1, y1 = sp["bbox"]
+                    out.append({"s": t, "x": x0, "y": y0, "h": sp["size"]})
+    return out
+
+def _group_lines(items, tol=6):
+    lines = []
+    for it in sorted(items, key=lambda a: (a["y"], a["x"])):
+        g = next((L for L in lines if abs(L["y"]-it["y"]) <= tol), None)
+        if not g:
+            g = {"y": it["y"], "parts": []}; lines.append(g)
+        g["parts"].append(it)
+    for L in lines:
+        L["parts"].sort(key=lambda a: a["x"])
+    return lines
+
+def _clean_name(s):
+    s = re.sub(r"[.．。・…‥､、，]+", "", str(s))
+    s = re.sub(r"[0-9０-９]+\s*$", "", s)
+    return re.sub(r"\s|　", "", s).strip()
+
+# ---------- 埋め込み目次 ----------
+def _is_junk_outline(toc):
+    titles = [t[1].strip() for t in toc]
+    if not titles: return True
+    junk = sum(1 for t in titles if re.match(r"^p(age|\.)?\s*\d+$", t, re.I) or t.isdigit() or t == "")
+    return junk/len(titles) >= 0.6
+
+def _rows_from_outline(doc, toc):
+    out = []
+    has_child = any(t[0] >= 2 for t in toc)
+    cur = ""
+    for level, title, page in toc:
+        title = (title or "").strip()
+        if has_child and level == 1:
+            cur = title
+            out.append({"chapter": title, "section": "（章扉）", "title": title, "start": page})
+        elif has_child:
+            out.append({"chapter": cur, "section": title, "title": title, "start": page})
+        else:
+            out.append({"chapter": "", "section": title, "title": title, "start": page})
+    return [r for r in out if r["start"]]
+
+# ---------- 目次ページ解析 ----------
+PART_RE = re.compile(r"第\s*([0-9０-９一二三四五六七八九十]+)\s*[部章編節]")
+CHAP_RE = re.compile(r"第\s*([0-9０-９一二三四五六七八九十]+)\s*章")
+
+def _right_col(items, w):
+    nums = []
+    for L in _group_lines([it for it in items if it["x"] >= w*0.8 and re.search(r"[\d０-９]", it["s"])], 6):
+        v = _parse_num("".join(p["s"] for p in L["parts"]))
+        if v is not None:
+            nums.append({"y": L["y"], "x": min(p["x"] for p in L["parts"]), "val": v})
+    return nums
+
+def _toc_column(nums):
+    if len(nums) < 6: return None
+    best = []
+    for a in nums:
+        g = [b for b in nums if abs(b["x"]-a["x"]) <= 12]
+        if len(g) > len(best): best = g
+    if len(best) < 6: return None
+    vals = [n["val"] for n in sorted(best, key=lambda a: a["y"])]
+    if len(set(vals)) < 5: return None
+    asc = sum(1 for i in range(1, len(vals)) if vals[i] >= vals[i-1])
+    if asc/(len(vals)-1) < 0.6: return None
+    return best
+
+def _overview_topics(pages):
+    for items, w in pages[:15]:
+        nums = [{"y": L["y"], "val": _parse_num("".join(p["s"] for p in L["parts"]))}
+                for L in _group_lines([it for it in items if it["x"] >= w*0.66 and re.search(r"[\d０-９]", it["s"])], 6)]
+        nums = [n for n in nums if n["val"] is not None]
+        if len(nums) < 3: continue
+        lefts = [{"y": L["y"], "raw": "".join(p["s"] for p in L["parts"])}
+                 for L in _group_lines([it for it in items if it["x"] < w*0.62], 6)]
+        lefts = [l for l in lefts if _has_jp(l["raw"])]
+        entries = []
+        for l in lefts:
+            best, bd = None, 99
+            for n in nums:
+                d = abs(n["y"]-l["y"])
+                if d <= 20 and d < bd: bd, best = d, n
+            entries.append({"raw": l["raw"], "page": best["val"] if best else None})
+        if len(entries) < 3: continue
+        pgs = [e["page"] for e in entries if e["page"] is not None]
+        gaps = sorted(abs(pgs[i]-pgs[i-1]) for i in range(1, len(pgs)))
+        if not gaps or gaps[len(gaps)//2] < 4: continue
+        cur, topics = "第1部", []
+        for k, e in enumerate(entries):
+            m = PART_RE.search(e["raw"])
+            if m:
+                n = _kan2num(m.group(1))
+                if n is not None: cur = f"第{n}部"
+            nm = _clean_name(PART_RE.sub("", e["raw"]))
+            if len(nm) < 2: continue
+            if re.search(r"[：:]", e["raw"]) or re.search(r"解説|著者|編集|まえがき", nm): continue
+            if not re.search(r"[ぁ-んァ-ヶ]", nm) and not re.search(r"[0-9０-９]", nm) and len(nm) <= 3: continue
+            if e["page"] is not None and k+1 < len(entries) and entries[k+1]["page"] == e["page"]: continue
+            topics.append({"part": cur, "name": nm})
+        if len(topics) >= 2:
+            return topics
+    return None
+
+def _interpolate(rows, key="page"):
+    known = [i for i, r in enumerate(rows) if r[key] is not None]
+    if not known: return
+    for k in range(known[0]): rows[k][key] = max(1, rows[known[0]][key]-(known[0]-k))
+    last = known[-1]
+    for k in range(last+1, len(rows)): rows[k][key] = rows[last][key]+(k-last)
+    for a in range(len(known)-1):
+        i, j = known[a], known[a+1]
+        pi, pj = rows[i][key], rows[j][key]
+        for k in range(i+1, j):
+            rows[k][key] = round(pi+(pj-pi)*(k-i)/(j-i))
+
+def _rows_from_toc(pages):
+    chap_re3 = re.compile(r"第\s*[0-9０-９一二三四五六七八九十]+\s*[部章編節]")
+    all_items = []
+    for items, w in pages:
+        nums = _toc_column(_right_col(items, w))
+        if not nums: continue
+        lefts = [{"y": L["y"], "title": re.sub(r"\s+", " ", "".join(p["s"] for p in L["parts"])).strip()}
+                 for L in _group_lines([it for it in items if it["x"] < w*0.64], 6)]
+        lefts = [l for l in lefts if _has_jp(l["title"]) and len(l["title"]) >= 2]
+        for l in lefts:
+            best, bd = None, 99
+            for n in nums:
+                d = abs(n["y"]-l["y"])
+                if d <= 16 and d < bd: bd, best = d, n
+            all_items.append({"title": l["title"], "page": best["val"] if best else None,
+                              "isChap": bool(chap_re3.search(l["title"]))})
+    if len(all_items) < 3: return []
+    # 単調増加チェック
+    last = 0
+    for r in all_items:
+        if r["page"] is None: continue
+        if last <= r["page"] <= last+50: last = r["page"]
+        else: r["page"] = None
+    _interpolate(all_items)
+    ov = _overview_topics(pages)
+    cur_part, topic, expl, bullet = "第1部", 0, None, False
+    rows = []
+    bullet_re = re.compile(r"^\s*[●○◯◆■▼▶・]\s*(.+)$")
+    for r in all_items:
+        t = r["title"]
+        m = PART_RE.search(t)
+        if m:
+            n = _kan2num(m.group(1))
+            if n is not None: cur_part = f"第{n}部"
+        hm = bullet_re.match(t)
+        if hm:
+            if not bullet and cur_part == "第1部": cur_part, bullet = "第2部", True
+            nm = _clean_name(hm.group(1))
+            if len(nm) >= 2: expl = nm
+            continue
+        sec = expl or ((ov[topic]["name"] if ov and topic < len(ov) else f"区分{topic+1}"))
+        rows.append({"chapter": cur_part, "section": sec, "title": t, "start": r["page"]})
+        if re.search(r"演習題|解答", t): topic += 1; expl = None
+    return rows
+
+# ---------- 本文見出し走査 ----------
+def _rows_from_heading_scan(pages):
+    allh = []
+    pinfo = []
+    for items, w, h in pages:
+        sizes = [it["h"] for it in items]
+        allh += sizes
+        pinfo.append({"items": items, "w": w, "h": h, "n": len(items),
+                      "full": "".join(it["s"] for it in items),
+                      "maxH": max(sizes) if sizes else 0})
+    gmed = statistics.median(allh) if allh else 12
+    sec_h = gmed*1.6
+    def big_line(p):
+        if p["maxH"] < sec_h: return None
+        cand = [it for it in p["items"] if it["h"] >= p["maxH"]*0.9 and it["y"] <= p["h"]*0.58]
+        if not cand: return None
+        cand.sort(key=lambda a: (a["y"], a["x"]))
+        return re.sub(r"\s+", " ", "".join(c["s"] for c in cand)).strip() or None
+    def is_toc(p): return bool(re.search(r"CONTENTS|目次", p["full"])) or len(re.findall(r"第\s*[0-9０-９一二三四五六七八九十]+\s*章", p["full"])) >= 3
+    def bad(s):
+        if not s or len(s) < 4: return True
+        if len(re.findall(r"[ぁ-んァ-ヶ一-龥]", s)) < 3: return True
+        if re.match(r"^(図|表|囲|團|圖|E\s)", s): return True
+        if re.search(r"CONTENTS|目次", s): return True
+        return False
+    def simkey(s): return re.sub(r"[「」『』（）()【】\[\]:：・.,。、!！?？~〜\-Ff]", "", re.sub(r"\s|　", "", s).lower())
+    cur_chap_n, cur_chap, found, prev = 0, "", False, None
+    rows = []
+    for i, p in enumerate(pinfo):
+        if is_toc(p): continue
+        cm = CHAP_RE.search(p["full"])
+        if cm and p["n"] <= 18:
+            n = _kan2num(cm.group(1))
+            if n is not None and n > cur_chap_n:
+                cur_chap_n = n; found = True
+                big = big_line(p); nm = big if (big and not CHAP_RE.search(big)) else ""
+                cur_chap = f"第{n}章" + (" "+nm if nm else ""); prev = cur_chap
+                rows.append({"chapter": cur_chap, "section": "（章扉）", "title": nm or cur_chap, "start": i+1, "isChap": True})
+                continue
+        big = big_line(p)
+        if not big or bad(big): continue
+        if prev and simkey(big) == simkey(prev): continue
+        prev = big
+        rows.append({"chapter": cur_chap, "section": big, "title": big, "start": i+1})
+    out = rows
+    if found:
+        fc = next((k for k, r in enumerate(rows) if r.get("isChap")), 0)
+        out = [r for k, r in enumerate(rows) if r.get("isChap") or k > fc]
+    return [{"chapter": r["chapter"], "section": r["section"], "title": r["title"], "start": r["start"]} for r in out]
+
+def _fill_ranges(rows, max_page):
+    rows.sort(key=lambda r: (r["start"] is None, r["start"] or 0))
+    for i, r in enumerate(rows):
+        if r["start"] is None: continue
+        if r.get("end") in (None, ""):
+            r["end"] = (rows[i+1]["start"]-1) if (i+1 < len(rows) and rows[i+1]["start"] is not None) else (max_page or r["start"])
+    return rows
+
+def analyze_pdf(doc, text_name):
+    pages_simple = []
+    pages_full = []
+    for i in range(doc.page_count):
+        pg = doc.load_page(i)
+        items = _page_spans(pg)
+        w, h = pg.rect.width, pg.rect.height
+        pages_simple.append((items, w))
+        pages_full.append((items, w, h))
+    rows, method, pdf_mode = [], "", True
+    toc = doc.get_toc()
+    if toc and not _is_junk_outline(toc):
+        rows = _rows_from_outline(doc, toc); method = "埋め込み目次"
+    if not rows:
+        rows = _rows_from_toc(pages_simple)
+        if rows: method, pdf_mode = "目次ページ解析（印刷ページ）", False
+    if not rows:
+        rows = _rows_from_heading_scan(pages_full); method = "本文走査（見出し推定）"
+    _fill_ranges(rows, doc.page_count if pdf_mode else None)
+    for r in rows:
+        r["text"] = text_name
+    return rows, method
 
 # ==========================================
 # メール・Drive・結果Sheets
@@ -468,6 +746,42 @@ def expand_uploaded_to_images(uploaded_file):
 # Streamlit Web UI
 # ==========================================
 st.title("📝 採点済みプリント 自動集計システム（逆引き統合版）")
+
+# ---- PDFから目次マスタを登録（逆引きアプリのPDF解析を統合） ----
+with st.expander("📄 PDFから目次マスタを登録（自動解析→確認・修正→登録）", expanded=False):
+    _creds_pdf = Credentials.from_authorized_user_info(GOOGLE_TOKEN_DICT)
+    pdf_up = st.file_uploader("テキストのPDF", type=["pdf"], key="pdf_master_up")
+    pdf_name_in = st.text_input("登録テキスト名（空欄ならファイル名）", key="pdf_name_in")
+    if pdf_up is not None and st.button("🔎 PDFを解析"):
+        try:
+            _doc = fitz.open(stream=pdf_up.getvalue(), filetype="pdf")
+            _name = (pdf_name_in or "").strip() or pdf_up.name.rsplit(".", 1)[0]
+            _rows, _method = analyze_pdf(_doc, _name)
+            st.session_state["pdf_rows"] = _rows
+            st.session_state["pdf_name"] = _name
+            st.session_state["pdf_method"] = _method
+            st.success(f"{len(_rows)} 件抽出しました（方式: {_method}）。下の表で確認・修正して登録してください。")
+        except Exception as e:
+            st.error(f"解析エラー: {e}")
+    if st.session_state.get("pdf_rows"):
+        st.caption(f"テキスト名: {st.session_state['pdf_name']} ／ 方式: {st.session_state.get('pdf_method','')}")
+        _df = pd.DataFrame([{ "章": r.get("chapter", ""), "節": r.get("section", ""),
+                              "節タイトル": r.get("title", ""), "開始ページ": r.get("start"),
+                              "終了ページ": r.get("end") } for r in st.session_state["pdf_rows"]])
+        _edited = st.data_editor(_df, num_rows="dynamic", width="stretch", key="pdf_editor")
+        if st.button("✅ このテキストを目次マスタに登録", type="primary"):
+            try:
+                _out = _edited.copy()
+                _out.insert(0, "テキスト名", st.session_state["pdf_name"])
+                _csv = _out.to_csv(index=False).encode("utf-8-sig")
+                n_t, n_r = register_master_csv(_creds_pdf, _csv)
+                st.success(f"目次マスタに登録しました（{n_t} テキスト / {n_r} 行）。")
+                for k in ("pdf_rows", "pdf_name", "pdf_method"):
+                    st.session_state.pop(k, None)
+                st.rerun()
+            except Exception as e:
+                st.error(f"登録エラー: {e}")
+
 
 creds_ui = Credentials.from_authorized_user_info(GOOGLE_TOKEN_DICT)
 master_index = load_master_index(creds_ui)  # [統合] Sheetから常時参照
