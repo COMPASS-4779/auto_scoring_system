@@ -572,10 +572,11 @@ def upload_to_drive(filepath, filename, folder_id, creds):
     file = service.files().create(body={'name': filename, 'parents': [folder_id]}, media_body=media, fields='webViewLink').execute()
     return file.get('webViewLink')
 
-def save_to_spreadsheet(student_name, subject, text_name, section_results, drive_link, creds, master_index):
-    """[統合] ページ番号からマスタ逆引きし 章/節/節タイトル を付けて結果へ書き込む。"""
+def save_to_spreadsheet(student_name, subject, text_name, section_results, drive_link, creds, master_index, user_page=None):
+    """[統合] ページ番号（ユーザー入力優先）からマスタ逆引きし 章/節/節タイトル を付けて結果へ書き込む。"""
     service = _sheets(creds)
     now = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    up = (str(user_page).strip() if user_page not in (None, "") else "")
     values = []
     for s in section_results:
         ai_chapter = s.get('chapter', '')
@@ -583,7 +584,7 @@ def save_to_spreadsheet(student_name, subject, text_name, section_results, drive
         total = s.get('total', 0)
         sec_page = s.get('page', '')
         for p in s.get('wrong', []):
-            page = p.get('page', '') or sec_page or '-'
+            page = up or p.get('page', '') or sec_page or '-'   # ユーザー入力ページを最優先
             m_ch, m_sec, m_title = lookup_section(master_index, text_name, page)
             chapter = m_ch or ai_chapter   # マスタ優先、無ければAI推定
             section = m_sec or ai_section
@@ -653,16 +654,19 @@ def background_processing_task(student_name, subject_name, text_name, selected_m
 
         ai_master_files = process_master_file_from_path(selected_master_path, client) if selected_master_path else []
 
-        for (photo_filepath, photo_name) in photos_data:
+        for _item in photos_data:
+            photo_filepath, photo_name = _item[0], _item[1]
+            user_page = _item[2] if len(_item) > 2 else None
             try:
                 common_rules = (
                     "【重要な判断基準】\n"
                     "・×や✗、赤ペンで訂正されている問題 = 間違い\n"
                     "・○や無印の問題 = 正解（wrongに含めない）\n"
                     "・計算の途中式や答えの数値（例: -8, 3/4）は問題番号ではない\n"
-                    "・問題番号は「1」「(2)」「問3」のような番号表記のみ\n"
+                    "・問題番号は「1」「(2)」「問3」「(ア)」「①」のような番号表記。"
+                    "手書きで番号（ア・イ・ウ や (1)・① 等）が振られている場合は、その手書き番号を正として優先的に読み取る。\n"
                     "・写真内に印刷されている『ページ番号』を読み取り、各間違い問題の page に半角数字で入れる。"
-                    "読めない場合のみ \"-\"。\n\n"
+                    "読めない場合のみ \"-\"（※最終的なページ番号は利用者入力を優先します）。\n\n"
                     f"【出力形式】\n"
                     f"chapterは常に \"{text_name}\"。sectionは項目内容。totalは総問題数。"
                     "wrongは間違いのみで page と number を入れる。\n\n"
@@ -683,20 +687,20 @@ def background_processing_task(student_name, subject_name, text_name, selected_m
                 match = re.search(r'\[.*\]', response.text, re.DOTALL)
                 section_results = json.loads(match.group(0)) if match else []
 
-                # [統合] 保存名の先頭に 章_節_節タイトル ヘッダーを付与
-                header_label = ""
-                for s in section_results:
-                    for w in s.get('wrong', []):
-                        ch, se, ti = lookup_section(master_index, text_name, w.get('page', ''))
-                        if se or ti:
-                            header_label = f"[{ch}_{se}_{ti}]".replace("/", "／")
-                            break
-                    if header_label:
-                        break
-                save_name = (header_label + "_" + photo_name) if header_label else photo_name
+                # [統合] ヘッダー（章_節_節タイトル）はユーザー入力ページから判定し、答案用紙を区別
+                ch, se, ti = lookup_section(master_index, text_name, user_page)
+                if not (se or ti):  # 入力が無ければGeminiの読み取りページで代替
+                    for s in section_results:
+                        for w in s.get('wrong', []):
+                            ch, se, ti = lookup_section(master_index, text_name, w.get('page', ''))
+                            if se or ti: break
+                        if se or ti: break
+                header_label = f"[{ch}_{se}_{ti}]".replace("/", "／") if (se or ti) else ""
+                pg_label = (str(user_page).strip() if user_page not in (None, "") else "")
+                save_name = ((header_label + ("_p" + pg_label if pg_label else "") + "_") if header_label else "") + photo_name
                 drive_link = upload_to_drive(photo_filepath, save_name, folder_id, creds)
 
-                save_to_spreadsheet(student_name, subject_name, text_name, section_results, drive_link, creds, master_index)
+                save_to_spreadsheet(student_name, subject_name, text_name, section_results, drive_link, creds, master_index, user_page=user_page)
                 send_notification_email_plan_b(f"【進捗】記録完了 ({photo_name})",
                                                json.dumps(section_results, ensure_ascii=False, indent=2) + f"\n\nリンク: {drive_link}")
             finally:
@@ -857,22 +861,50 @@ with col_left:
 
     uploaded_photos = st.file_uploader("採点済み写真／PDF／Word（複数可）", type=['jpg', 'jpeg', 'png', 'pdf', 'docx', 'doc'], accept_multiple_files=True)
 
+    # [統合] アップロード内容が変わった時だけ画像へ展開（PDF=各ページ、Word=埋め込み画像）
+    if uploaded_photos:
+        sig = tuple((f.name, f.size) for f in uploaded_photos)
+        if st.session_state.get("img_sig") != sig:
+            imgs = []
+            for f in uploaded_photos:
+                imgs.extend(expand_uploaded_to_images(f))
+            st.session_state["pending_images"] = imgs   # [(path, name), ...]
+            st.session_state["img_sig"] = sig
+            st.session_state["page_df"] = pd.DataFrame([{"画像": n, "ページ番号": ""} for (_pp, n) in imgs])
+    else:
+        for k in ("pending_images", "img_sig", "page_df"):
+            st.session_state.pop(k, None)
+
+    if st.session_state.get("pending_images"):
+        st.caption(f"📄 {len(st.session_state['pending_images'])} 枚の画像。各画像（＝答案用紙）の『ページ番号』を入力してください。"
+                   "章・節・節タイトルはこのページ番号からテキスト目次マスタを逆引きして判定します。")
+        edited_pages = st.data_editor(
+            st.session_state["page_df"], width="stretch", key="page_editor",
+            disabled=["画像"], hide_index=True,
+            column_config={"ページ番号": st.column_config.TextColumn("ページ番号", help="例: 8 や 75")})
+        st.session_state["page_df"] = edited_pages
+
     if st.button("🚀 送信して完了", type="primary"):
-        if not student_name or not uploaded_photos or not text_name:
-            st.error("生徒名・テキスト名・写真は必須です")
+        if not student_name or not st.session_state.get("pending_images") or not text_name:
+            st.error("生徒名・テキスト名・画像は必須です")
         else:
+            imgs = st.session_state["pending_images"]
+            try:
+                pages_col = list(st.session_state["page_df"]["ページ番号"])
+            except Exception:
+                pages_col = []
             photos_data = []
-            for up_file in uploaded_photos:
-                photos_data.extend(expand_uploaded_to_images(up_file))  # 画像/PDF/Word を画像群へ展開
-            if not photos_data:
-                st.error("画像を取り出せませんでした（PDF/Wordに画像が含まれていない可能性があります）。")
-            else:
-                threading.Thread(
-                    target=background_processing_task,
-                    args=(student_name, subject_name, text_name, selected_master_path, photos_data, GEMINI_API_KEY, GOOGLE_TOKEN_DICT, master_index)
-                ).start()
-                st.success(f"✅ 受付完了！（{len(photos_data)} 枚の画像を処理します）進捗はメールで通知されます。")
-                st.balloons()
+            for i, (path, name) in enumerate(imgs):
+                pg = (str(pages_col[i]).strip() if i < len(pages_col) and pages_col[i] is not None else "")
+                photos_data.append((path, name, pg))
+            threading.Thread(
+                target=background_processing_task,
+                args=(student_name, subject_name, text_name, selected_master_path, photos_data, GEMINI_API_KEY, GOOGLE_TOKEN_DICT, master_index)
+            ).start()
+            st.success(f"✅ 受付完了！（{len(photos_data)} 枚の画像を処理します）進捗はメールで通知されます。")
+            st.balloons()
+            for k in ("pending_images", "img_sig", "page_df"):
+                st.session_state.pop(k, None)
 
 with col_right:
     st.subheader("📊 現在の集計結果")
