@@ -1041,10 +1041,13 @@ with col_left:
         st.markdown("**📄 各画像（答案用紙）のページ番号を入力してください**　"
                     "— このページ番号からテキスト目次マスタを逆引きして、章・節・節タイトルを記入します。")
         _imgs0 = st.session_state["pending_images"]
-        _cols = st.columns(2) if len(_imgs0) > 1 else [st]
-        for idx, (path, name) in enumerate(_imgs0):
-            with (_cols[idx % len(_cols)]):
-                st.text_input(f"{idx+1}. {name}", key=f"pgin_{idx}", placeholder="ページ番号（例: 8）")
+        if len(_imgs0) > 1:
+            _cols = st.columns(2)
+            for idx, (path, name) in enumerate(_imgs0):
+                with _cols[idx % 2]:
+                    st.text_input(f"{idx+1}. {name}", key=f"pgin_{idx}", placeholder="ページ番号（例: 8）")
+        else:
+            st.text_input(f"1. {_imgs0[0][1]}", key="pgin_0", placeholder="ページ番号（例: 8）")
 
     if st.button("🚀 送信して完了", type="primary"):
         if not student_name or not st.session_state.get("pending_images") or not text_name:
