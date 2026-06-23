@@ -600,6 +600,17 @@ def _fill_ranges(rows, max_page):
             r["end"] = (rows[i+1]["start"]-1) if (i+1 < len(rows) and rows[i+1]["start"] is not None) else (max_page or r["start"])
     return rows
 
+def _garbled_ratio(rows):
+    if not rows: return 0.0
+    bad = 0
+    for r in rows:
+        s = (r.get("section") or "") + (r.get("title") or "")
+        jp = len(re.findall(r"[ぁ-んァ-ヶ一-龥]", s))
+        sym = len(re.findall(r"[\u25a0\u25a1\u3010\u3011\uff5c|\uff1d=:：；;、。\[\]「」『』]", s))
+        if jp < 2 or sym > jp:
+            bad += 1
+    return bad / len(rows)
+
 def analyze_pdf(doc, text_name):
     pages_simple = []
     pages_full = []
@@ -618,10 +629,68 @@ def analyze_pdf(doc, text_name):
         if rows: method, pdf_mode = "目次ページ解析（印刷ページ）", False
     if not rows:
         rows = _rows_from_heading_scan(pages_full); method = "本文走査（見出し推定）"
+        empty_chap = sum(1 for r in rows if not (r.get("chapter") or "").strip()) / max(1, len(rows))
+        if _garbled_ratio(rows) > 0.45 or empty_chap > 0.8:   # フォント破損で文字化け/章不明→自動解析不可
+            rows = []
+            method = "解析不可（目次・見出しが文字化け）：CSV登録または手入力をご利用ください"
     _fill_ranges(rows, doc.page_count if pdf_mode else None)
     for r in rows:
         r["text"] = text_name
     return rows, method
+
+# ==========================================
+# [統合] Gemini画像解析（文字化けPDFの目次を画像から読む・高精度）
+# ==========================================
+def analyze_pdf_gemini(doc, text_name, api_key):
+    client = genai.Client(api_key=api_key)
+    model = get_best_model(client)
+    toc_pages = []
+    for i in range(min(25, doc.page_count)):
+        pg = doc.load_page(i)
+        if _toc_column(_right_col(_page_spans(pg), pg.rect.width)):
+            toc_pages.append(i)
+    if not toc_pages:
+        toc_pages = [min(3, doc.page_count - 1)]
+    prompt = (
+        "これは学習参考書の目次ページの画像です。階層は『編または部 ＞ 章 ＞ 項目（題名）』です。\n"
+        "見出し行を JSON 配列で返してください。各要素は "
+        "{\"chapter\": \"\", \"section\": \"\", \"title\": \"\", \"page\": 0}。\n"
+        "・chapter = 最上位区分（例: 第1編 力と運動 / 特集 / 巻末特集）。同じ編の各行に同じ chapter を入れる。\n"
+        "・section = 章レベルのラベル（例: 第1章。編末問題は \"編末問題\"。特集の項目は ①②③ 等）。\n"
+        "・title = 章/項目の題名（編末問題は空文字 \"\"）。\n"
+        "・page = その行の右にある開始ページ番号（半角整数）。\n"
+        "2段組のときは左列→右列の順。JSON配列だけを出力。"
+    )
+    rows = []
+    for i in toc_pages[:4]:
+        pix = doc.load_page(i).get_pixmap(dpi=200)
+        tmp = os.path.join(tempfile.gettempdir(), f"toc_{uuid.uuid4().hex}.png")
+        pix.save(tmp)
+        try:
+            af = client.files.upload(file=tmp)
+            while af.state.name == 'PROCESSING':
+                time.sleep(1); af = client.files.get(name=af.name)
+            resp = client.models.generate_content(model=model, contents=[af, prompt])
+            m = re.search(r'\[.*\]', resp.text, re.DOTALL)
+            if m:
+                for o in json.loads(m.group(0)):
+                    rows.append({"chapter": str(o.get("chapter", "")).strip(),
+                                 "section": str(o.get("section", "")).strip(),
+                                 "title": str(o.get("title", "")).strip(),
+                                 "start": _to_int(o.get("page"))})
+        finally:
+            try: os.remove(tmp)
+            except: pass
+    seen, uniq = set(), []
+    for r in rows:
+        k = (r["chapter"], r["section"], r["title"], r["start"])
+        if k in seen: continue
+        seen.add(k); uniq.append(r)
+    _fill_ranges(uniq, None)
+    for r in uniq:
+        r["text"] = text_name
+    return uniq, "AI画像解析（Gemini）"
+
 
 # ==========================================
 # メール・Drive・結果Sheets
@@ -838,11 +907,22 @@ with st.expander("📄 PDFから目次マスタを登録（自動解析→確認
     _creds_pdf = Credentials.from_authorized_user_info(GOOGLE_TOKEN_DICT)
     pdf_up = st.file_uploader("テキストのPDF", type=["pdf"], key="pdf_master_up")
     pdf_name_in = st.text_input("登録テキスト名（空欄ならファイル名）", key="pdf_name_in")
+    use_gemini = st.checkbox("🤖 AI画像解析（Gemini）を使う（文字化けPDF・複雑な目次向け／高精度）", key="pdf_use_gemini")
     if pdf_up is not None and st.button("🔎 PDFを解析"):
         try:
             _doc = fitz.open(stream=pdf_up.getvalue(), filetype="pdf")
             _name = (pdf_name_in or "").strip() or pdf_up.name.rsplit(".", 1)[0]
-            _rows, _method = analyze_pdf(_doc, _name)
+            if use_gemini:
+                _rows, _method = analyze_pdf_gemini(_doc, _name, GEMINI_API_KEY)
+            else:
+                _rows, _method = analyze_pdf(_doc, _name)
+                if (not _rows) or _method.startswith("解析不可"):
+                    try:
+                        gr, gm = analyze_pdf_gemini(_doc, _name, GEMINI_API_KEY)
+                        if gr:
+                            _rows, _method = gr, gm + "（自動切替）"
+                    except Exception as ge:
+                        st.warning(f"AI画像解析に失敗: {ge}")
             st.session_state["pdf_rows"] = _rows
             st.session_state["pdf_name"] = _name
             st.session_state["pdf_method"] = _method
