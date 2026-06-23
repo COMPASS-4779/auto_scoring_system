@@ -1038,27 +1038,26 @@ with col_left:
             st.session_state.pop(k, None)
 
     if st.session_state.get("pending_images"):
-        st.caption(f"📄 {len(st.session_state['pending_images'])} 枚の画像。各画像（＝答案用紙）の『ページ番号』を入力してください。"
-                   "章・節・節タイトルはこのページ番号からテキスト目次マスタを逆引きして判定します。")
-        edited_pages = st.data_editor(
-            st.session_state["page_df"], width="stretch", key="page_editor",
-            disabled=["画像"], hide_index=True,
-            column_config={"ページ番号": st.column_config.TextColumn("ページ番号", help="例: 8 や 75")})
-        st.session_state["page_df"] = edited_pages
+        st.markdown("**📄 各画像（答案用紙）のページ番号を入力してください**　"
+                    "— このページ番号からテキスト目次マスタを逆引きして、章・節・節タイトルを記入します。")
+        _imgs0 = st.session_state["pending_images"]
+        _cols = st.columns(2) if len(_imgs0) > 1 else [st]
+        for idx, (path, name) in enumerate(_imgs0):
+            with (_cols[idx % len(_cols)]):
+                st.text_input(f"{idx+1}. {name}", key=f"pgin_{idx}", placeholder="ページ番号（例: 8）")
 
     if st.button("🚀 送信して完了", type="primary"):
         if not student_name or not st.session_state.get("pending_images") or not text_name:
             st.error("生徒名・テキスト名・画像は必須です")
         else:
             imgs = st.session_state["pending_images"]
-            try:
-                pages_col = list(st.session_state["page_df"]["ページ番号"])
-            except Exception:
-                pages_col = []
+            missing = [name for i, (path, name) in enumerate(imgs) if not str(st.session_state.get(f"pgin_{i}", "") or "").strip()]
             photos_data = []
             for i, (path, name) in enumerate(imgs):
-                pg = (str(pages_col[i]).strip() if i < len(pages_col) and pages_col[i] is not None else "")
+                pg = str(st.session_state.get(f"pgin_{i}", "") or "").strip()
                 photos_data.append((path, name, pg))
+            if missing:
+                st.warning("ページ番号が未入力の画像があります（そのまま送信すると章・節は空になります）：" + " / ".join(missing[:5]))
             threading.Thread(
                 target=background_processing_task,
                 args=(student_name, subject_name, text_name, selected_master_path, photos_data, GEMINI_API_KEY, GOOGLE_TOKEN_DICT, master_index)
