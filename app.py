@@ -415,24 +415,97 @@ def _interpolate(rows, key="page"):
         for k in range(i+1, j):
             rows[k][key] = round(pi+(pj-pi)*(k-i)/(j-i))
 
-def _rows_from_toc(pages):
+TOP_RE = re.compile(r"第\s*[0-9０-９一二三四五六七八九十]+\s*[編部]")
+SUB_RE = re.compile(r"^第\s*([0-9０-９一二三四五六七八九十]+)\s*[章節]")
+SPECIAL_TOP = re.compile(r"(特集|巻末特集|付録|総合問題|序章|終章|巻頭)")
+BULLET_RE2 = re.compile(r"^\s*([❶-❿①-⑳]|\([0-9０-９]+\)|[0-9０-９]+[\.．])\s*")
+_GARBAGE = set("国醒ヨ駈田四■誼遍囲團圖□〇・·-—|ー")
+
+def _strip_box(s):
+    s = s.strip()
+    i = 0
+    while i < len(s) and (s[i] in _GARBAGE or s[i] in "0123456789０１２３４５６７８９ \t　"):
+        i += 1
+    return s[i:].strip()
+
+def _collect_toc_lines(pages):
     chap_re3 = re.compile(r"第\s*[0-9０-９一二三四五六七八九十]+\s*[部章編節]")
-    all_items = []
+    out = []
     for items, w in pages:
         nums = _toc_column(_right_col(items, w))
         if not nums: continue
-        lefts = [{"y": L["y"], "title": re.sub(r"\s+", " ", "".join(p["s"] for p in L["parts"])).strip()}
-                 for L in _group_lines([it for it in items if it["x"] < w*0.64], 6)]
-        lefts = [l for l in lefts if _has_jp(l["title"]) and len(l["title"]) >= 2]
-        for l in lefts:
+        rec = []
+        for L in _group_lines([it for it in items if it["x"] < w*0.66], 6):
+            title = re.sub(r"\s+", " ", "".join(p["s"] for p in L["parts"])).strip()
+            if not _has_jp(title) or len(title) < 2: continue
+            rec.append({"y": L["y"], "title": title,
+                        "size": max(p["h"] for p in L["parts"]),
+                        "x": min(p["x"] for p in L["parts"])})
+        if not rec: continue
+        lens = sorted(len(r["title"]) for r in rec)
+        if lens[len(lens)//2] > 30 or sum(1 for r in rec if len(r["title"]) <= 30) < max(4, len(rec)*0.5):
+            continue  # 散文ばかりの本文/解答ページを除外
+        med_x = sorted(r["x"] for r in rec)[len(rec)//2]
+        paired = 0
+        for r in rec:
             best, bd = None, 99
             for n in nums:
-                d = abs(n["y"]-l["y"])
+                d = abs(n["y"]-r["y"])
                 if d <= 16 and d < bd: bd, best = d, n
-            all_items.append({"title": l["title"], "page": best["val"] if best else None,
-                              "isChap": bool(chap_re3.search(l["title"]))})
+            r["page"] = best["val"] if best else None
+            if best: paired += 1
+            r["is_top"] = r["x"] <= med_x - 8           # 左端の見出し＝上位区分（編/部/特集 等）
+            r["isChap"] = bool(chap_re3.search(r["title"]))
+        # 「見出し＋ページ番号」が大半でなければ目次ページでない（解答/本文の誤検出を除外）
+        if paired < max(5, len(rec)*0.45):
+            continue
+        out.extend(rec)
+    return out
+
+def _hier_map(items):
+    rows, hen, cur_name, special = [], 1, "", None
+    for it in items:
+        t = it["title"].strip()
+        if it.get("is_top"):
+            if "巻末" in t:
+                special = "巻末特集"; continue
+            if ("トレーニング" in t) or ("特集" in t):
+                special = "特集"; continue
+            name = _strip_box(t)
+            if name:
+                cur_name = name      # 編の名称（化けたボックス接頭辞は除去）
+            continue
+        clean = _strip_box(t)
+        if len(clean) < 1:
+            continue   # 番号ボックスのみ等のゴミ行は飛ばす
+        chap = special if special else ("第%d編" % hen + ((" " + cur_name) if cur_name else ""))
+        sm = SUB_RE.match(t)
+        if sm:
+            sec = t[:sm.end()].strip(); sectitle = t[sm.end():].strip() or clean
+        else:
+            bm = BULLET_RE2.match(t)
+            if bm:
+                sec = bm.group(1).strip(); sectitle = t[bm.end():].strip() or clean
+                if special is None:
+                    chap = "特集"
+            elif re.match(r"^編[末未]問題", t):
+                sec = "編末問題"; sectitle = "編末問題"
+            else:
+                sec, sectitle = clean, clean
+        rows.append({"chapter": chap, "section": sec, "title": sectitle, "start": it["page"]})
+        if re.match(r"^編[末未]問題", t) and special is None:
+            hen += 1; cur_name = ""    # 編末問題で次の編へ
+    _interpolate(rows, "start")
+    return rows
+
+def _rows_from_toc(pages):
+    all_items = _collect_toc_lines(pages)
     if len(all_items) < 3: return []
-    # 単調増加チェック
+    has_top = any(it.get("is_top") for it in all_items)
+    has_sub = any(SUB_RE.match(it["title"]) or BULLET_RE2.match(it["title"]) for it in all_items)
+    if has_top and has_sub:
+        return _hier_map(all_items)
+    # ---- 従来方式（概観トピック名 + ● + 区分） ----
     last = 0
     for r in all_items:
         if r["page"] is None: continue
