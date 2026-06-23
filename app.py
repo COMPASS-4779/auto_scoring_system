@@ -463,38 +463,46 @@ def _collect_toc_lines(pages):
     return out
 
 def _hier_map(items):
-    rows, hen, cur_name, special = [], 1, "", None
+    rows = []
+    hen, cur_name, special = 1, "", None
+    chap_no = 0          # 書籍の章番号（編配下、連番で欠番OCRを補完）
+    item_no = 0          # 特集等の項目番号
+    cur_chap = None
+    CIRCLED = "①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳"
+    chapline = re.compile(r"^第\s*([0-9０-９一二三四五六七八九十]*)\s*[章節]")
     for it in items:
         t = it["title"].strip()
         if it.get("is_top"):
             if "巻末" in t:
-                special = "巻末特集"; continue
+                special = "巻末特集"; cur_chap = None; item_no = 0; continue
             if ("トレーニング" in t) or ("特集" in t):
-                special = "特集"; continue
+                special = "特集"; cur_chap = None; item_no = 0; continue
             name = _strip_box(t)
-            if name:
-                cur_name = name      # 編の名称（化けたボックス接頭辞は除去）
+            if name: cur_name = name
             continue
         clean = _strip_box(t)
         if len(clean) < 1:
-            continue   # 番号ボックスのみ等のゴミ行は飛ばす
+            continue
         chap = special if special else ("第%d編" % hen + ((" " + cur_name) if cur_name else ""))
-        sm = SUB_RE.match(t)
-        if sm:
-            sec = t[:sm.end()].strip(); sectitle = t[sm.end():].strip() or clean
-        else:
-            bm = BULLET_RE2.match(t)
-            if bm:
-                sec = bm.group(1).strip(); sectitle = t[bm.end():].strip() or clean
-                if special is None:
-                    chap = "特集"
-            elif re.match(r"^編[末未]問題", t):
-                sec = "編末問題"; sectitle = "編末問題"
-            else:
-                sec, sectitle = clean, clean
+        if chap != cur_chap:
+            cur_chap = chap; item_no = 0
+        m = chapline.match(t)
+        if (special is None) and m:
+            n = _kan2num(m.group(1)) if m.group(1) else None
+            chap_no = n if (n is not None) else chap_no + 1
+            rows.append({"chapter": chap, "section": "第%d章" % chap_no,
+                         "title": t[m.end():].strip(), "start": it["page"]})
+            continue
+        if re.match(r"^編[末未]問題", t):
+            rows.append({"chapter": chap, "section": "編末問題", "title": "", "start": it["page"]})
+            if special is None:
+                hen += 1; cur_name = ""
+            continue
+        # 特集/巻末などの項目 → 節は連番ラベル、節タイトルは名称（先頭の丸記号は除去）
+        item_no += 1
+        sec = CIRCLED[item_no-1] if item_no <= len(CIRCLED) else str(item_no)
+        sectitle = re.sub(r"^[〇◎●○◯❶-❿①-⑳・\s]+", "", clean).strip() or clean
         rows.append({"chapter": chap, "section": sec, "title": sectitle, "start": it["page"]})
-        if re.match(r"^編[末未]問題", t) and special is None:
-            hen += 1; cur_name = ""    # 編末問題で次の編へ
     _interpolate(rows, "start")
     return rows
 
