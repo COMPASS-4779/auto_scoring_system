@@ -93,6 +93,17 @@ def _to_int(v):
     m = re.search(r"\d+", str(v).translate(str.maketrans("０１２３４５６７８９", "0123456789")))
     return int(m.group()) if m else None
 
+def _page_from_filename(name):
+    """ファイル名から『ページ番号』を推定（p45 / page45 / 45ページ / 頁 等の明示マーカーがある時のみ）。"""
+    s = str(name).translate(str.maketrans("０１２３４５６７８９", "0123456789"))
+    m = re.search(r"(?:p\.?|page|ｐ|ページ|頁)\s*([0-9]{1,3})", s, re.IGNORECASE)
+    if m:
+        return m.group(1)
+    m = re.search(r"([0-9]{1,3})\s*(?:ページ|頁)", s)
+    if m:
+        return m.group(1)
+    return ""
+
 def _sheets(creds):
     return build('sheets', 'v4', credentials=creds)
 
@@ -1032,14 +1043,18 @@ with col_left:
                 imgs.extend(expand_uploaded_to_images(f))
             st.session_state["pending_images"] = imgs   # [(path, name), ...]
             st.session_state["img_sig"] = sig
-            st.session_state["page_df"] = pd.DataFrame([{"画像": n, "ページ番号": ""} for (_pp, n) in imgs])
+            # ファイル名にページ番号があれば自動でプリフィル（無ければ空）
+            for _i, (_pp, _nm) in enumerate(imgs):
+                st.session_state[f"pgin_{_i}"] = _page_from_filename(_nm)
     else:
         for k in ("pending_images", "img_sig", "page_df"):
             st.session_state.pop(k, None)
 
     if st.session_state.get("pending_images"):
-        st.markdown("**📄 各画像（答案用紙）のページ番号を入力してください**　"
-                    "— このページ番号からテキスト目次マスタを逆引きして、章・節・節タイトルを記入します。")
+        st.markdown("**📄 各画像（答案用紙）のページ番号**　"
+                    "— ファイル名にページ番号があれば自動入力されます（例: `数学_p45.jpg`）。"
+                    "空欄でも写真に印刷されたページ番号をAIが読み取って補います。"
+                    "このページ番号からテキスト目次マスタを逆引きし、章・節・節タイトルを記入します。")
         _imgs0 = st.session_state["pending_images"]
         if len(_imgs0) > 1:
             _cols = st.columns(2)
