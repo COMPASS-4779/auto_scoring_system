@@ -833,7 +833,109 @@ def get_best_model(client):
         pass
     return 'gemini-1.5-pro'
 
-def background_processing_task(student_name, subject_name, text_name, selected_master_path, photos_data, api_key, token_dict, master_index):
+
+# ==========================================
+# [確認テスト] 解答付きPDF → 大問→項目 の対応表を抽出
+# ==========================================
+def parse_confirmation_test(pdf_bytes, filename=""):
+    """確認テスト（解答付きPDF）から {name, field, items:{大問番号:項目名}} を返す。
+    大問1〜は出典行の『NN.分野 / トピック』を優先し、無ければ大問見出しから推定する。"""
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    q_parts = []
+    for i in range(doc.page_count):
+        t = doc[i].get_text()
+        if i > 0 and ("解答" in t and "解説" in t):   # 解答・解説の手前まで
+            break
+        q_parts.append(t)
+    lines = [ln.strip() for ln in "\n".join(q_parts).splitlines()]
+
+    field = ""
+    for ln in lines:
+        if "（" in ln and "テスト" in ln:
+            field = ln.split("（")[0].strip()
+            break
+
+    # 出典行：NN.分野 / トピック が大問順に並ぶ
+    src_items = []
+    for ln in lines:
+        if ln.startswith("出典"):
+            inside = ln
+            m = re.search(r"（(.+)", ln)
+            if m:
+                inside = m.group(1)
+            for chunk in re.split(r"／", inside):
+                mm = re.match(r"\s*\d+\.\s*(.+)", chunk)
+                if mm:
+                    item = re.sub(r"[…\)）\s]+$", "", mm.group(1)).strip()
+                    item = re.sub(r"\s*/\s*", " / ", item)
+                    if item:
+                        src_items.append(item)
+            break
+
+    def topic_from_heading(h):
+        h = (h or "").strip()
+        m = re.search(r"【([^】]+)】", h)
+        if m:
+            return m.group(1).strip()
+        for sep in ("：", ":"):
+            if sep in h:
+                return h.split(sep)[0].strip()
+        m = re.match(r"(.+?)(に関する|を用いて|について)", h)
+        if m:
+            return m.group(1).strip()
+        return h[:20].strip()
+
+    headings = {}
+    for i, ln in enumerate(lines):
+        if re.fullmatch(r"\d{1,2}", ln):
+            n = int(ln)
+            for j in range(i + 1, min(i + 3, len(lines))):
+                nxt = lines[j]
+                if re.search(r"[ぁ-んァ-ヶ一-龥]", nxt) and len(nxt) >= 6:
+                    headings.setdefault(n, topic_from_heading(nxt))
+                    break
+
+    max_n = max([*headings.keys(), len(src_items)] or [0])
+    items = {}
+    for n in range(1, max_n + 1):
+        if n - 1 < len(src_items):
+            items[n] = src_items[n - 1]              # 出典（分野 / トピック）を優先
+        elif n in headings:
+            items[n] = headings[n]                    # 見出しトピックのみ（分野は付けない）
+        else:
+            items[n] = f"大問{n}"
+
+    name = re.sub(r"\.[^.]+$", "", filename).strip() if filename else (lines[0] if lines else "確認テスト")
+    return {"name": name, "field": field, "items": items}
+
+
+def save_confirm_to_spreadsheet(student_name, subject, test_name, conf_items, section_results, drive_link, creds):
+    """[確認テスト] ×印から読んだ大問・小問番号を、章＝項目 / 番号＝番号 として記録する。"""
+    service = _sheets(creds)
+    now = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    values = []
+    for s in section_results:
+        daimon = str(s.get('daimon', s.get('page', ''))).strip()
+        item = conf_items.get(_to_int(daimon), s.get('section', '')) if conf_items else s.get('section', '')
+        total = s.get('total', 0)
+        for w in s.get('wrong', []):
+            values.append([
+                now, student_name, subject, test_name,
+                daimon,          # ページ列＝大問番号
+                item,            # 章列＝項目
+                "",              # 節列は未使用
+                w.get('number', '-'),   # 番号列
+                drive_link, total, "",
+            ])
+    if values:
+        service.spreadsheets().values().append(
+            spreadsheetId=SPREADSHEET_ID, range='A1',
+            valueInputOption='USER_ENTERED', body={'values': values}
+        ).execute()
+    return len(values)
+
+
+def background_processing_task(student_name, subject_name, text_name, selected_master_path, photos_data, api_key, token_dict, master_index, mode="text", conf_items=None):
     try:
         creds = Credentials.from_authorized_user_info(token_dict)
         client = genai.Client(api_key=api_key)
@@ -847,6 +949,38 @@ def background_processing_task(student_name, subject_name, text_name, selected_m
             photo_filepath, photo_name = _item[0], _item[1]
             user_page = _item[2] if len(_item) > 2 else None
             try:
+                if mode == "confirm":
+                    item_list = "\n".join(f"大問{n}: {it}" for n, it in (conf_items or {}).items())
+                    cprompt = (
+                        "これは採点済みの『確認テスト』答案の写真です。\n"
+                        "×印・赤ペンで訂正/バツが付いた小問＝間違い、○や無印＝正解（間違いに含めない）。\n"
+                        "各大問（ページ上部の大きな数字 1,2,3…）ごとに、間違えた小問番号（(1),(2),(ア) など）を"
+                        "すべて読み取ってください。小問が1つだけの大問で×なら number は \"-\" とする。\n"
+                        "計算の途中式や答えの数値（例:-8, 3/4）は番号ではありません。手書きの番号があればそれを優先。\n\n"
+                        f"【この確認テストの大問構成】\n{item_list}\n\n"
+                        "【出力形式】JSON配列のみを返す。\n"
+                        '[{"daimon":"1","total":2,"wrong":[{"number":"(1)"}]}]'
+                    )
+                    ai_photo = client.files.upload(file=photo_filepath)
+                    while ai_photo.state.name == 'PROCESSING':
+                        time.sleep(1); ai_photo = client.files.get(name=ai_photo.name)
+                    response = client.models.generate_content(model=best_model, contents=[ai_photo, cprompt])
+                    match = re.search(r'\[.*\]', response.text, re.DOTALL)
+                    section_results = json.loads(match.group(0)) if match else []
+                    first_item = ""
+                    for s in section_results:
+                        first_item = (conf_items or {}).get(_to_int(s.get('daimon', '')), "")
+                        if first_item:
+                            break
+                    save_name = (f"[{first_item}]_".replace("/", "／") if first_item else "") + photo_name
+                    drive_link = upload_to_drive(photo_filepath, save_name, folder_id, creds)
+                    n_saved = save_confirm_to_spreadsheet(student_name, subject_name, text_name,
+                                                          conf_items, section_results, drive_link, creds)
+                    send_notification_email_plan_b(
+                        f"【進捗】確認テスト記録 ({photo_name})",
+                        json.dumps(section_results, ensure_ascii=False, indent=2) + f"\n\n{n_saved}件記録 / リンク: {drive_link}")
+                    continue
+
                 common_rules = (
                     "【重要な判断基準】\n"
                     "・×や✗、赤ペンで訂正されている問題 = 間違い\n"
@@ -1069,25 +1203,62 @@ with col_left:
                 st.rerun()
     subj_pick = st.selectbox("科目", options=subjects + ["（手入力）"], index=None)
     subject_name = st.text_input("科目（手入力）") if subj_pick == "（手入力）" else (subj_pick or "")
-    # [統合] テキスト名は登録済みマスタから選択可（手入力も可）
-    text_options = list(master_index.keys())
-    if text_options:
-        picked = st.selectbox("テキスト名（マスタから選択／逆引き対象）", options=text_options + ["（手入力）"], index=None)
-        text_name = st.text_input("テキスト名（手入力）") if picked == "（手入力）" else (picked or "")
-    else:
-        text_name = st.text_input("テキスト名")
+    # ---- 採点モード切替 ----
+    grade_mode = st.radio("採点モード",
+                          ["📄 テキスト（ページ番号→章/節）", "📝 確認テスト（項目・番号）"],
+                          horizontal=True)
+    conf_mode = grade_mode.startswith("📝")
 
-    master_option = st.radio("マスターテキスト（採点比較用の画像/PDF）", ["💾 保存済みを使う", "🆕 新規アップロード", "❌ 指定しない"])
     selected_master_path = None
-    if master_option == "💾 保存済みを使う":
-        master_files = [f for f in os.listdir(MASTER_DIR) if f.endswith(('.pdf', '.png', '.jpg'))]
-        if master_files:
-            selected_master_path = os.path.join(MASTER_DIR, st.selectbox("テキストを選択", master_files))
-    elif master_option == "🆕 新規アップロード":
-        um = st.file_uploader("マスターPDF/画像", type=['pdf', 'jpg', 'png'])
-        if um:
-            selected_master_path = os.path.join(MASTER_DIR, um.name)
-            with open(selected_master_path, "wb") as f: f.write(um.getvalue())
+    conf_items = None
+    if conf_mode:
+        st.caption("採点済みの確認テスト（解答付きPDF）をアップロードすると、大問→項目の対応を自動抽出します。"
+                   "写真の×印から『項目』と『番号』を読み取って記録します。")
+        conf_pdf = st.file_uploader("確認テスト（解答付きPDF）", type=["pdf"], key="conf_pdf")
+        if conf_pdf is not None:
+            sigc = (conf_pdf.name, conf_pdf.size)
+            if st.session_state.get("conf_sig") != sigc:
+                try:
+                    parsed = parse_confirmation_test(conf_pdf.getvalue(), conf_pdf.name)
+                    st.session_state["conf_parsed"] = parsed
+                    st.session_state["conf_sig"] = sigc
+                except Exception as e:
+                    st.error(f"確認テストの解析エラー: {e}")
+        parsed = st.session_state.get("conf_parsed")
+        if parsed:
+            text_name = parsed["name"]
+            conf_items = parsed["items"]
+            st.success(f"確認テスト名: {text_name}（分野: {parsed.get('field','') or '—'}）")
+            _mdf = pd.DataFrame([{"大問": n, "項目（章に記録）": it} for n, it in conf_items.items()])
+            _medit = st.data_editor(_mdf, num_rows="dynamic", width="stretch", key="conf_map_editor")
+            # 表で項目名を修正できるように反映
+            try:
+                conf_items = {int(r["大問"]): str(r["項目（章に記録）"]) for _, r in _medit.iterrows()
+                              if str(r.get("大問", "")).strip() != ""}
+                st.session_state["conf_parsed"]["items"] = conf_items
+            except Exception:
+                pass
+        else:
+            text_name = ""
+    else:
+        # [統合] テキスト名は登録済みマスタから選択可（手入力も可）
+        text_options = list(master_index.keys())
+        if text_options:
+            picked = st.selectbox("テキスト名（マスタから選択／逆引き対象）", options=text_options + ["（手入力）"], index=None)
+            text_name = st.text_input("テキスト名（手入力）") if picked == "（手入力）" else (picked or "")
+        else:
+            text_name = st.text_input("テキスト名")
+
+        master_option = st.radio("マスターテキスト（採点比較用の画像/PDF）", ["💾 保存済みを使う", "🆕 新規アップロード", "❌ 指定しない"])
+        if master_option == "💾 保存済みを使う":
+            master_files = [f for f in os.listdir(MASTER_DIR) if f.endswith(('.pdf', '.png', '.jpg'))]
+            if master_files:
+                selected_master_path = os.path.join(MASTER_DIR, st.selectbox("テキストを選択", master_files))
+        elif master_option == "🆕 新規アップロード":
+            um = st.file_uploader("マスターPDF/画像", type=['pdf', 'jpg', 'png'])
+            if um:
+                selected_master_path = os.path.join(MASTER_DIR, um.name)
+                with open(selected_master_path, "wb") as f: f.write(um.getvalue())
 
     uploaded_photos = st.file_uploader("採点済み写真／PDF／Word（複数可）", type=['jpg', 'jpeg', 'png', 'pdf', 'docx', 'doc'], accept_multiple_files=True)
 
@@ -1107,7 +1278,7 @@ with col_left:
         for k in ("pending_images", "img_sig", "page_df"):
             st.session_state.pop(k, None)
 
-    if st.session_state.get("pending_images"):
+    if st.session_state.get("pending_images") and not conf_mode:
         st.markdown("**📄 各画像（答案用紙）のページ番号**　"
                     "— ファイル名にページ番号があれば自動入力されます（例: `数学_p45.jpg`）。"
                     "空欄でも写真に印刷されたページ番号をAIが読み取って補います。"
@@ -1120,9 +1291,27 @@ with col_left:
                     st.text_input(f"{idx+1}. {name}", key=f"pgin_{idx}", placeholder="ページ番号（例: 8）")
         else:
             st.text_input(f"1. {_imgs0[0][1]}", key="pgin_0", placeholder="ページ番号（例: 8）")
+    elif st.session_state.get("pending_images") and conf_mode:
+        st.caption(f"📝 確認テストモード：{len(st.session_state['pending_images'])} 枚を、写真の×印から"
+                   "『大問→項目』『小問番号』を読み取って記録します（ページ番号入力は不要）。")
 
     if st.button("🚀 送信して完了", type="primary"):
-        if not student_name or not st.session_state.get("pending_images") or not text_name:
+        if conf_mode:
+            if not student_name or not st.session_state.get("pending_images") or not text_name or not conf_items:
+                st.error("生徒名・確認テストPDF・答案画像は必須です")
+            else:
+                imgs = st.session_state["pending_images"]
+                photos_data = [(path, name) for (path, name) in imgs]
+                threading.Thread(
+                    target=background_processing_task,
+                    args=(student_name, subject_name, text_name, None, photos_data,
+                          GEMINI_API_KEY, GOOGLE_TOKEN_DICT, master_index, "confirm", conf_items)
+                ).start()
+                st.success(f"✅ 受付完了！確認テスト『{text_name}』の答案 {len(photos_data)} 枚を処理します。進捗はメールで通知されます。")
+                st.balloons()
+                for k in ("pending_images", "img_sig", "page_df"):
+                    st.session_state.pop(k, None)
+        elif not student_name or not st.session_state.get("pending_images") or not text_name:
             st.error("生徒名・テキスト名・画像は必須です")
         else:
             imgs = st.session_state["pending_images"]
