@@ -93,6 +93,13 @@ def _to_int(v):
     m = re.search(r"\d+", str(v).translate(str.maketrans("０１２３４５６７８９", "0123456789")))
     return int(m.group()) if m else None
 
+def _text_name_from_filename(fn):
+    """ファイル名からテキスト名を推定（末尾の _text_章節リスト / _章節リスト / 拡張子を除去）。"""
+    base = re.sub(r"\.[^.]+$", "", str(fn))
+    base = re.sub(r"[_\s]*(text)?[_\s]*章節リスト$", "", base, flags=re.IGNORECASE)
+    base = re.sub(r"[_\s]*目次$", "", base)
+    return base.strip()
+
 def _page_from_filename(name):
     """ファイル名から『ページ番号』を推定（p45 / page45 / 45ページ / 頁 等の明示マーカーがある時のみ）。"""
     s = str(name).translate(str.maketrans("０１２３４５６７８９", "0123456789"))
@@ -164,8 +171,10 @@ def load_master_index(creds):
         print(f"[統合] load_master_index error: {e}")
     return index
 
-def register_master_csv(creds, file_bytes):
-    """逆引きアプリの「テキスト目次マスタ.csv」を取り込み、目次マスタ タブへ反映（同名テキストは置換）。"""
+def register_master_csv(creds, file_bytes, default_text_name=""):
+    """目次CSVを取り込み、目次マスタ タブへ反映（同名テキストは置換）。
+       テキスト名列が無いCSV（章節リスト等）は default_text_name（ファイル名由来）を使う。
+       列は 章/節/節タイトル/開始ページ/終了ページ を自動判別（開始問題番号などは無視）。"""
     text = file_bytes.decode("utf-8-sig", errors="replace")
     reader = csv.DictReader(io.StringIO(text))
     new_rows, new_names = [], set()
@@ -175,14 +184,19 @@ def register_master_csv(creds, file_bytes):
                 if n in row and row[n] is not None:
                     return str(row[n]).strip()
             return ""
-        tname = col("テキスト名", "教材名")
+        tname = col("テキスト名", "教材名") or (default_text_name or "").strip()
         if not tname:
             continue
+        chapter = col("章", "編")
+        section = col("節", "項")
+        title = col("節タイトル", "タイトル", "見出し")
+        start = col("開始ページ", "ページ", "頁")
+        end = col("終了ページ", "終了")
+        # 章/節 の2階層のみ（節タイトル列なし）の場合、節を節タイトルにも入れて見やすく
+        if not title and section:
+            title = section
         new_names.add(tname)
-        new_rows.append([
-            tname, col("章"), col("節"), col("節タイトル", "タイトル"),
-            col("開始ページ", "ページ"), col("終了ページ"),
-        ])
+        new_rows.append([tname, chapter, section, title, start, end])
     if not new_rows:
         return 0, 0
     # 既存を読み、同名テキストを除外して結合
@@ -728,6 +742,19 @@ def get_drive_folder_id(student_name, creds):
     folders = results.get('files', [])
     return folders[0]['id'] if folders else None
 
+def ensure_drive_folder(student_name, creds):
+    """親フォルダ(PARENT_FOLDER_ID)配下に同名フォルダが無ければ新規作成。(folder_id, 新規作成したか) を返す。"""
+    service = build('drive', 'v3', credentials=creds)
+    safe = str(student_name).replace("'", "\'")
+    query = f"'{PARENT_FOLDER_ID}' in parents and name = '{safe}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+    folders = service.files().list(q=query, fields="files(id)").execute().get('files', [])
+    if folders:
+        return folders[0]['id'], False
+    created = service.files().create(
+        body={'name': str(student_name), 'mimeType': 'application/vnd.google-apps.folder', 'parents': [PARENT_FOLDER_ID]},
+        fields='id').execute()
+    return created.get('id'), True
+
 def upload_to_drive(filepath, filename, folder_id, creds):
     service = build('drive', 'v3', credentials=creds)
     media = MediaFileUpload(filepath, mimetype='image/jpeg', resumable=True)
@@ -972,23 +999,39 @@ with st.sidebar:
         st.success("登録済みテキスト：\n- " + "\n- ".join(master_index.keys()))
     else:
         st.warning("未登録です。逆引きアプリの『マスタを書き出す』で出力したCSVを登録してください。")
-    up = st.file_uploader("テキスト目次マスタ.csv を登録", type=["csv"], key="master_csv")
-    if up is not None and st.button("⬆️ マスタに登録（目次マスタタブへ保存）"):
-        try:
-            n_text, n_row = register_master_csv(creds_ui, up.getvalue())
-            st.success(f"{n_text} テキスト / {n_row} 行を登録しました。")
-            st.rerun()
-        except Exception as e:
-            st.error(f"登録エラー: {e}")
+    ups = st.file_uploader("目次CSV を登録（複数可・章節リストCSVも可）", type=["csv"],
+                           accept_multiple_files=True, key="master_csv")
+    st.caption("テキスト名の列が無いCSV（例: 『〇〇_章節リスト.csv』）は、ファイル名をテキスト名として登録します。")
+    if ups and st.button("⬆️ マスタに登録（目次マスタタブへ保存）"):
+        tot_t, tot_r, errs = 0, 0, []
+        for up in ups:
+            try:
+                dn = _text_name_from_filename(up.name)
+                nt, nr = register_master_csv(creds_ui, up.getvalue(), default_text_name=dn)
+                tot_t += nt; tot_r += nr
+            except Exception as e:
+                errs.append(f"{up.name}: {e}")
+        if tot_r:
+            st.success(f"{tot_t} テキスト / {tot_r} 行を登録しました。")
+        if errs:
+            st.error("一部失敗： " + " / ".join(errs))
+        st.rerun()
 
     st.divider()
     st.subheader("👤 生徒名の管理")
     ns = st.text_input("生徒名を追加", key="new_student")
     if st.button("➕ 生徒を追加"):
-        if add_list_item(creds_ui, STUDENT_TAB, "生徒名", ns):
-            st.success("追加しました"); st.rerun()
+        _nm = (ns or "").strip()
+        if not _nm:
+            st.warning("生徒名を入力してください")
         else:
-            st.warning("空欄、または既に登録済みです")
+            add_list_item(creds_ui, STUDENT_TAB, "生徒名", _nm)   # 名簿へ（重複は無視）
+            try:
+                _fid, _created = ensure_drive_folder(_nm, creds_ui)
+                st.success(f"「{_nm}」を追加しました（Driveフォルダ：{'新規作成' if _created else '既存を使用'}）")
+            except Exception as _e:
+                st.warning(f"名簿には追加しましたが、Driveフォルダ作成でエラー: {_e}")
+            st.rerun()
     ds = st.selectbox("削除する生徒", options=["（選択）"] + students, key="del_student")
     if st.button("🗑 生徒を削除") and ds and ds != "（選択）":
         remove_list_item(creds_ui, STUDENT_TAB, "生徒名", ds); st.success("削除しました"); st.rerun()
@@ -1010,6 +1053,20 @@ col_left, col_right = st.columns([1, 1])
 with col_left:
     st.subheader("👤 講師用アップロード画面")
     student_name = st.selectbox("生徒名", options=students, index=None)
+    with st.expander("＋ 新しい生徒を追加（Driveフォルダも自動作成）"):
+        _ns2 = st.text_input("生徒名", key="new_student_main")
+        if st.button("追加してフォルダ作成", key="add_student_main"):
+            _nm2 = (_ns2 or "").strip()
+            if not _nm2:
+                st.warning("生徒名を入力してください")
+            else:
+                add_list_item(creds_ui, STUDENT_TAB, "生徒名", _nm2)
+                try:
+                    _fid2, _c2 = ensure_drive_folder(_nm2, creds_ui)
+                    st.success(f"「{_nm2}」を追加（Driveフォルダ：{'新規作成' if _c2 else '既存を使用'}）")
+                except Exception as _e2:
+                    st.warning(f"名簿追加OK・Driveフォルダ作成でエラー: {_e2}")
+                st.rerun()
     subj_pick = st.selectbox("科目", options=subjects + ["（手入力）"], index=None)
     subject_name = st.text_input("科目（手入力）") if subj_pick == "（手入力）" else (subj_pick or "")
     # [統合] テキスト名は登録済みマスタから選択可（手入力も可）
