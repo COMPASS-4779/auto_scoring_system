@@ -35,6 +35,13 @@ import uuid
 import threading
 import fitz  # PyMuPDF
 import pandas as pd
+from PIL import Image
+try:
+    import pillow_heif
+    pillow_heif.register_heif_opener()   # iPhoneのHEIC/HEIFを読めるように登録
+    _HEIC_OK = True
+except Exception:
+    _HEIC_OK = False
 import smtplib
 from email.mime.text import MIMEText
 from email.header import Header
@@ -1051,7 +1058,12 @@ def expand_uploaded_to_images(uploaded_file):
     data = uploaded_file.getvalue()
     out = []
     try:
-        if ext in ('jpg', 'jpeg', 'png', 'bmp', 'webp', 'gif'):
+        if ext in ('heic', 'heif'):
+            img = Image.open(io.BytesIO(data)).convert('RGB')
+            tmp = os.path.join(tempfile.gettempdir(), f"photo_{uuid.uuid4().hex}.jpg")
+            img.save(tmp, 'JPEG', quality=95)
+            out.append((tmp, re.sub(r'\.(heic|heif)$', '.jpg', name, flags=re.IGNORECASE)))
+        elif ext in ('jpg', 'jpeg', 'png', 'bmp', 'webp', 'gif'):
             tmp = os.path.join(tempfile.gettempdir(), f"photo_{uuid.uuid4().hex}.{ext if ext!='jpeg' else 'jpg'}")
             with open(tmp, 'wb') as f: f.write(data)
             out.append((tmp, name))
@@ -1267,7 +1279,9 @@ with col_left:
                 selected_master_path = os.path.join(MASTER_DIR, um.name)
                 with open(selected_master_path, "wb") as f: f.write(um.getvalue())
 
-    uploaded_photos = st.file_uploader("採点済み写真／PDF／Word（複数可）", type=['jpg', 'jpeg', 'png', 'pdf', 'docx', 'doc'], accept_multiple_files=True)
+    uploaded_photos = st.file_uploader("採点済み写真／PDF／Word（複数可・iPhoneのHEICも可）",
+                                       type=['jpg', 'jpeg', 'png', 'heic', 'heif', 'pdf', 'docx', 'doc'],
+                                       accept_multiple_files=True)
 
     # [統合] アップロード内容が変わった時だけ画像へ展開（PDF=各ページ、Word=埋め込み画像）
     if uploaded_photos:
