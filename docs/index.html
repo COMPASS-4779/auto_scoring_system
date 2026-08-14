@@ -76,6 +76,49 @@
 <div id="splash">
   <div class="ring"></div>
   <div class="t">採点システムを開いています…</div>
+  <div class="fallback">自動で開かない場合は <a href="https://compass-scoring.streamlit.app/">こちらをタップ</a></div>
+</div>
+<script>
+  if('serviceWorker' in navigator){ try{ navigator.serviceWorker.register('./sw.js'); }catch(e){} }
+  setTimeout(function(){ window.location.replace("https://compass-scoring.streamlit.app/"); }, 600);
+</script>
+</body>
+</html>
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1, user-scalable=no">
+<title>採点システム</title>
+<meta name="theme-color" content="#0f203f">
+<link rel="manifest" href="./manifest.webmanifest">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="採点システム">
+<link rel="apple-touch-icon" href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAALQAAAC0CAIAAACyr5FlAAAFsUlEQVR4nO3dMY7cOBRFUfbAEzvvyLmDWYJzL9j7mMBb6E1MMgEBoeCqr6Ykkv896p7IwHhsirr6rKpGt9++fvtRgFf+yl4AdBEHQsSBEHEgRBwIEQdCxIEQcSBEHAgRB0LEgRBxIEQcCBEHQsSBEHEgRBwIEQdCxIEQcSBEHAgRB0LEgRBxIEQcCBEHQsSBEHEgRBwIEQdCxIHQl+wFpPn3/b/23/zPx9/jViLrLnEcSqHlf79DLovHcbGJlj954UrWjGNcEzt/13qVLBXHzCZ2/vZlKlkkjtws/lAXs0Ai9nFIZfFogUSM45DN4pF1IpZxWGTxyDQRv09I7crY2K3caXLYbe4zrxFiMzkWKGPjci0ecbjsZjuLK1I/VoZuYuN4H7QG/SPmTflfTeh+V7rcCc1VjaAbR8d7MGj39Vd4kWgcXfZ92o57rbadYhzX9zplo02XvUMujotbnL6/7ut/pBXHlZ2V2tY1LkQojtMbqrObf3C/IpUPwdz38aXTaxP5iEwljnOUy6j0V7hD4lg58aDYbbrjNeZPDsddO+HEmtMPl+Q4blJGZddH/uQ4xLeMymv9mXEcfSy8djZy9CoSh0daHPcso3Lpw+NYWamMyuKKcuJIfx1uJ2XHDCaHxUN2gv51JcTBD8bYHLq6+cNDenKsXUalfI2z4+DVxhWTd093cig/Un3JXunUOBgb183cQ9HJIfswDaJ5vaJxQMG8OMrnoeZjNFr7VU87WZgcCMnF4Tg2Pn7/6vLnqF37pDgWfp9Sy+jVR6M5+yk3OXx9/P41OZHRtOJQm6ufeq7hYh9SOzAjjlXPlKiDOSNkwq5qTQ4j+7f//fvPaSsZRygOqYmaSGcfhOIwcoexUYjjhJuUUYijr5XKKBPiWOytitQnGaP3VmVy6LwK2zHtQBHZDZU49N3npcaGOBAijiY3HBuFOFrcs4xCHBctXEYhjk9JvXedjDj23PZAqYjjpOXLKMSx484HSkUcr938QKmI4wXKqNaPo+/pcJ8yik4cg77AeOL7BhReaoh8KXt4HIlfYHy8zY233OtAGb23KpOju+7fNKBWxgRrxnGuA4UDRcqCcezc43P/qdxybBSpOLq8Cvv06X/5G6TKEHk1WqTi6KLlRnJ8NJoRx+Q3LEf7kBob7Sbsqtbk6DVR2/tQK0PnTClqcUymVoaaSXHM/yhw7Vs7Zz/lJkfHuXqlj5S2pM6UIhhHX+fu8dpTp928OLJ+lKLLnRb8UZyLT47qUB8uMU0gGkf307fxlmeVofZqo5oah8j3B0csZsbMPRSdHGXK8Hj//lMhCM2xUebHkTs8HlPYfl1/oVDJpybvnu7kKGMeqZcpJJYhOzZKKW9fv/2Y/7fybwBW4vsgPTkq5WfrCv3ryolj4WEwSMqOGUyO4vCQHWVxRWlxHH0ULHaz0dFryRq0mZPjnn24lFFcjpWNex9e60+O48Rj4bW/j06sPPeVe/7kuEkfdmWUrA/Bnp273+nb18L30vInxxX6I0R/hTtU4jj9oCjv/um1KYyNonOsVFfutMiGVmtciFYc5fIkSN9Z9/U/kouj9DgpUrbYdNk7FOMonV5JTNtrr9W2E42jdH2lOWjf9Vd4kW4cZcA7kS73QHNVI0jHUQa/U228KwprSKEeR6X8YcZpyllUKh+C7dPfx6MsrsgjjmKym41cruVL9gIOqHtqfcS4ZFHZTI6N1/4+slu50+TY2I0Quywqyzgqi0RMs6iM46hkE7HOorKPo5JKZIEsqkXiqLa7klLJMk1slopjM7OS9ZrYrBnHZlwlCzexWTyOzfO9FP/xBwruEseze97vQ/w+IcU0xIEQcSBEHAgRB0LEgRBxIEQcCBEHQsSBEHEgRBwIEQdCxIEQcSBEHAgRB0LEgdD/7EcfObrbabIAAAAASUVORK5CYII=">
+<link rel="icon" href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAABwElEQVR4nO1Zu27DMAx0imbu7ql7hn5C9nxw/iNDfsE/kaWDAMOw9SCPp7BCeVOASOQdST1Mnb6+t9PI+PAmYEUI8EYI8EYI8EYI8MbwAj57GH3Mr9JfP8uZ64spoML7OIalhCNAQj07xS7DKgCgfpxukWFaxEb2FDtgBljUdwaBVCACJOyzVJoTH/NLq6Gk/SKrkxC6pxhJoC2jKq9pMKUOdYu45BLbRkqzVMIUJZS1SzmPLJaHvwtJBfQLf8mOsJDwDHCvZbA1kQDisbU87/LBEr9gBrCAJfbL856Vgdl0W8QlGVq0BbDq50h3vtzs3pEMALkWhhsw7FZCkvBL8A4BWPEI8W9OYhhdwz/RBezo9mY/cQWs5xTRZhOIgOzevOVdUtIMP3DmtAUI9+YdOVYemt6ZJVQPML36E0ABpVyXWFJuDVmIBKhOeGKkJX7xEqoELGmYL7f1h8VaHfFR7w1dZ47bF6IY1GWA0opqzvJpLaray8Qugbq5K3QPt3q6d6flVAC86X1goraXtwYBmLbRrq1FIayL2JgK/1fKLQ+VjL/1Tpywchr1pX4FnWUFw9+FQoA3QoA3QoA3QoA3fgGdoMh4j/J3zQAAAABJRU5ErkJggg==">
+<style>
+  html,body{margin:0;height:100%;background:#0f203f;overflow:hidden;}
+  #frame{border:0;width:100vw;height:100vh;height:100dvh;display:block;}
+  #splash{position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;
+    justify-content:center;background:#0f203f;color:#fff;
+    font-family:system-ui,-apple-system,"Hiragino Kaku Gothic ProN",sans-serif;
+    transition:opacity .45s ease;z-index:10;padding:env(safe-area-inset-top) 0 0;}
+  #splash.hide{opacity:0;pointer-events:none;}
+  #splash img{width:96px;height:96px;border-radius:22px;margin-bottom:20px;}
+  .ring{width:56px;height:56px;border:6px solid rgba(255,255,255,.22);
+    border-top-color:#e03a3a;border-radius:50%;animation:spin 1s linear infinite;}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  .t{margin-top:18px;font-size:15px;opacity:.85}
+  .fallback{margin-top:22px;font-size:13px;opacity:.8}
+  .fallback a{color:#7db3ff}
+</style>
+</head>
+<body>
+<div id="splash">
+  <div class="ring"></div>
+  <div class="t">採点システムを開いています…</div>
   <div class="fallback">自動で開かない場合は <a id="open" href="https://compass-scoring.streamlit.app/">こちらをタップ</a></div>
 </div>
 <script>
