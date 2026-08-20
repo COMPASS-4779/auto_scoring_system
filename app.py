@@ -859,10 +859,79 @@ def _clean_title(s):
     if m: return m.group(1).strip()
     return re.split(r"[。．]", s)[0][:28].strip()
 
-def parse_confirmation_test(pdf_bytes, filename=""):
+def _vision_extract_confirm_units(doc, api_key, max_pages=60):
+    """フォントがアウトライン化(パス化)されテキスト抽出できないPDF向け：
+    ページ画像をGeminiに読ませ、単元(色付き見出し)→大問→小問数 を構造化して返す。
+    戻り値: [{"unit":..., "no":..., "subs":..., "title":""}] （回・単元・大問番号で重複排除済み）"""
+    client = genai.Client(api_key=api_key)
+    model = get_best_model(client)
+    n = min(doc.page_count, max_pages)
+    uploaded = []
+    for i in range(n):
+        pix = doc.load_page(i).get_pixmap(dpi=150)
+        tmp = os.path.join(tempfile.gettempdir(), f"conf_{uuid.uuid4().hex}.png")
+        pix.save(tmp)
+        af = client.files.upload(file=tmp)
+        while af.state.name == 'PROCESSING':
+            time.sleep(1); af = client.files.get(name=af.name)
+        uploaded.append(af)
+    prompt = (
+        "これは確認テスト（解答付き）のページ画像です。文字が画像化されているため、"
+        "見た目のレイアウトを読み取って構造化してください。\n"
+        "各ページには『第N回』という回数、色付きの縦棒が付いた見出し（＝単元名。例：代名詞／be動詞（現在形）／"
+        "一般動詞（過去形）／進行形／命令文 など）、その下に「1.」「2.」…と続く大問、"
+        "各大問の下に (1)(2)(3)… と続く小問があります。\n"
+        "同じ回の中でも単元が変わるたびに大問番号は1から振り直されます。\n"
+        "[解答]ページと、対応する（解答なしの）問題ページは同じ構造が重複して現れるので、"
+        "回・単元・大問番号の組み合わせごとに1件だけ出力してください（重複禁止）。\n"
+        "出力はJSON配列だけ。各要素は "
+        '{"round":"第1回","unit":"代名詞","no":1,"subs":3}。\n'
+        "unit はページ上部の色付き見出しの文字をそのまま使うこと。"
+        "subs はその大問に含まれる小問 (1)(2)(3)… の個数（数値）。"
+    )
+    rows = []
+    try:
+        resp = client.models.generate_content(model=model, contents=uploaded + [prompt])
+        m = re.search(r'\[.*\]', resp.text, re.DOTALL)
+        if m:
+            seen = {}
+            order = []
+            for o in json.loads(m.group(0)):
+                unit = str(o.get("unit", "")).strip()
+                no = _to_int(o.get("no"))
+                subs = _to_int(o.get("subs")) or 0
+                rnd = str(o.get("round", "")).strip()
+                if not unit or not no:
+                    continue
+                key = (rnd, unit, no)
+                if key not in seen:
+                    seen[key] = {"unit": unit, "no": no, "subs": subs, "title": ""}
+                    order.append(key)
+                elif subs > seen[key]["subs"]:
+                    seen[key]["subs"] = subs
+            rows = [seen[k] for k in order]
+    except Exception:
+        rows = []
+    return rows
+
+
+def parse_confirmation_test(pdf_bytes, filename="", api_key=None):
     """確認テストPDF → {name, field, rows:[{unit,no,subs,title}]}"""
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     pages = [doc[i].get_text() for i in range(doc.page_count)]
+
+    # フォントがアウトライン化(パス化)されておりテキストが一切抽出できない場合は、
+    # 画像として Gemini に読み取らせる（単元見出しはページ上部の色付きバー）。
+    if sum(len(t.strip()) for t in pages) == 0 and api_key:
+        vrows = _vision_extract_confirm_units(doc, api_key)
+        if vrows:
+            units = []
+            for r in vrows:
+                if r["unit"] not in units:
+                    units.append(r["unit"])
+            name = re.sub(r"\.[^.]+$", "", filename).strip() if filename else "確認テスト"
+            return {"name": name, "field": "", "units": units, "rows": vrows}
+
     q_end = len(pages)
     for i, t in enumerate(pages):
         if i > 0 and ("解答" in t or "解説" in t):
@@ -1117,6 +1186,7 @@ def expand_uploaded_to_images(uploaded_file):
     out = []
     try:
         if ext in ('heic', 'heif'):
+            # iPhoneのHEIC/HEIF → JPEGへ変換（Geminiが読める形式にする）
             img = Image.open(io.BytesIO(data)).convert('RGB')
             tmp = os.path.join(tempfile.gettempdir(), f"photo_{uuid.uuid4().hex}.jpg")
             img.save(tmp, 'JPEG', quality=95)
@@ -1296,7 +1366,8 @@ with col_left:
             sigc = (conf_pdf.name, conf_pdf.size)
             if st.session_state.get("conf_sig") != sigc:
                 try:
-                    parsed = parse_confirmation_test(conf_pdf.getvalue(), conf_pdf.name)
+                    with st.spinner("確認テストを解析中…（画像から読み取る場合は数十秒かかります）"):
+                        parsed = parse_confirmation_test(conf_pdf.getvalue(), conf_pdf.name, GEMINI_API_KEY)
                     st.session_state["conf_parsed"] = parsed
                     st.session_state["conf_sig"] = sigc
                 except Exception as e:
