@@ -845,74 +845,133 @@ def get_best_model(client):
 # [確認テスト] 解答付きPDF → 大問→項目 の対応表を抽出
 # ==========================================
 def parse_confirmation_test(pdf_bytes, filename=""):
-    """確認テスト（解答付きPDF）から {name, field, items:{大問番号:項目名}} を返す。
-    大問1〜は出典行の『NN.分野 / トピック』を優先し、無ければ大問見出しから推定する。"""
+    """確認テストPDFから {name, field, items:{大問番号:項目名}} を返す（多様なレイアウトに対応）。"""
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    q_parts = []
-    for i in range(doc.page_count):
-        t = doc[i].get_text()
-        if i > 0 and ("解答" in t and "解説" in t):   # 解答・解説の手前まで
-            break
-        q_parts.append(t)
-    lines = [ln.strip() for ln in "\n".join(q_parts).splitlines()]
+    pages = [doc[i].get_text() for i in range(doc.page_count)]
 
+    # 解答・解説の手前までを「問題部」とする（無ければ全体）
+    q_end = len(pages)
+    for i, t in enumerate(pages):
+        if i > 0 and ("解答" in t and "解説" in t):
+            q_end = i
+            break
+    q_lines  = [ln.strip() for ln in "\n".join(pages[:q_end]).splitlines()]
+    all_lines = [ln.strip() for ln in "\n".join(pages).splitlines()]
+
+    # 分野（タイトル行の「（」より前）
     field = ""
-    for ln in lines:
+    for ln in q_lines or all_lines:
         if "（" in ln and "テスト" in ln:
             field = ln.split("（")[0].strip()
             break
 
-    # 出典行：NN.分野 / トピック が大問順に並ぶ
+    # 出典：NN.分野 / トピック が大問順に並ぶ（複数行に折り返す場合も連結して解析）
     src_items = []
-    for ln in lines:
+    _src_lines = q_lines or all_lines
+    for i, ln in enumerate(_src_lines):
         if ln.startswith("出典"):
-            inside = ln
-            m = re.search(r"（(.+)", ln)
-            if m:
-                inside = m.group(1)
+            buf = ln
+            for j in range(i + 1, min(i + 6, len(_src_lines))):
+                if "）" in buf or "第" in buf and "版" in buf:
+                    break
+                buf += _src_lines[j]
+            m = re.search(r"（(.+)", buf)
+            inside = m.group(1) if m else buf
             for chunk in re.split(r"／", inside):
                 mm = re.match(r"\s*\d+\.\s*(.+)", chunk)
                 if mm:
-                    item = re.sub(r"[…\)）\s]+$", "", mm.group(1)).strip()
-                    item = re.sub(r"\s*/\s*", " / ", item)
-                    if item:
-                        src_items.append(item)
+                    it = re.sub(r"[…\)）\s]+$", "", mm.group(1)).strip()
+                    it = re.sub(r"\s*/\s*", " / ", it)
+                    if it:
+                        src_items.append(it)
             break
 
-    def topic_from_heading(h):
-        h = (h or "").strip()
-        m = re.search(r"【([^】]+)】", h)
+    JP = r"[ぁ-んァ-ヶ一-龥]"
+
+    def clean_title(s):
+        s = (s or "").strip()
+        s = re.sub(r"^[\s　.．、,:：)）\]】]+", "", s)
+        m = re.search(r"【([^】]+)】", s)
         if m:
             return m.group(1).strip()
         for sep in ("：", ":"):
-            if sep in h:
-                return h.split(sep)[0].strip()
-        m = re.match(r"(.+?)(に関する|を用いて|について)", h)
+            if sep in s:
+                head = s.split(sep)[0].strip()
+                if len(head) >= 2:
+                    return head
+        m = re.match(r"(.+?)(に関する|を用いて|について|に answer)", s)
         if m:
             return m.group(1).strip()
-        return h[:20].strip()
+        s = re.split(r"[。．]", s)[0]
+        return s[:28].strip()
 
-    headings = {}
-    for i, ln in enumerate(lines):
-        if re.fullmatch(r"\d{1,2}", ln):
-            n = int(ln)
-            for j in range(i + 1, min(i + 3, len(lines))):
-                nxt = lines[j]
-                if re.search(r"[ぁ-んァ-ヶ一-龥]", nxt) and len(nxt) >= 6:
-                    headings.setdefault(n, topic_from_heading(nxt))
-                    break
+    def detect(lines):
+        found = {}   # n -> title
+        for i, ln in enumerate(lines):
+            if not ln:
+                continue
+            n = None; rest = ""
+            # 第1問 / 大問1 / 問1
+            m = re.match(r"^(?:大問|第)\s*([0-9０-９]{1,2})\s*問[\.．:：、]?\s*(.*)$", ln)
+            if not m:
+                m = re.match(r"^問\s*([0-9０-９]{1,2})[\.．)）:：、]?\s*(.*)$", ln)
+            if m:
+                n = m.group(1); rest = m.group(2)
+            # 【1】
+            if n is None:
+                m = re.match(r"^[【\[]\s*([0-9０-９]{1,2})\s*[】\]]\s*(.*)$", ln)
+                if m: n = m.group(1); rest = m.group(2)
+            # 1. / 1) / 1、  ＋ 日本語本文
+            if n is None:
+                m = re.match(r"^([0-9０-９]{1,2})\s*[\.．)）、]\s*(\S.*)$", ln)
+                if m and re.search(JP, m.group(2)):
+                    n = m.group(1); rest = m.group(2)
+            # 1 三角比の値に関する…（同一行・スペース区切り）
+            if n is None:
+                m = re.match(r"^([0-9０-９]{1,2})[ 　]+(\S.*)$", ln)
+                if m and re.search(JP, m.group(2)) and len(m.group(2)) >= 4:
+                    n = m.group(1); rest = m.group(2)
+            # 単独の数字行 → 次の日本語行を見出しに
+            if n is None and re.fullmatch(r"[0-9０-９]{1,2}", ln):
+                n = ln
+                for j in range(i + 1, min(i + 4, len(lines))):
+                    nx = lines[j]
+                    if re.search(JP, nx) and len(nx) >= 4:
+                        rest = nx
+                        break
+            if n is None:
+                continue
+            num = int(str(n).translate(str.maketrans("０１２３４５６７８９", "0123456789")))
+            if not (1 <= num <= 40):
+                continue
+            title = clean_title(rest)
+            if num not in found or (not found[num] and title):
+                found[num] = title
+        # 1 から連続する範囲だけ採用（ページ番号などの誤検出を除外）
+        out = {}
+        n = 1
+        while n in found:
+            out[n] = found[n]
+            n += 1
+        return out
+
+    headings = detect(q_lines) or detect(all_lines)
 
     max_n = max([*headings.keys(), len(src_items)] or [0])
     items = {}
     for n in range(1, max_n + 1):
         if n - 1 < len(src_items):
-            items[n] = src_items[n - 1]              # 出典（分野 / トピック）を優先
-        elif n in headings:
-            items[n] = headings[n]                    # 見出しトピックのみ（分野は付けない）
+            items[n] = src_items[n - 1]
+        elif headings.get(n):
+            items[n] = headings[n]
         else:
             items[n] = f"大問{n}"
 
-    name = re.sub(r"\.[^.]+$", "", filename).strip() if filename else (lines[0] if lines else "確認テスト")
+    # 何も検出できなかった場合でも空にせず、編集用の行を用意する
+    if not items:
+        items = {n: f"大問{n}" for n in range(1, 4)}
+
+    name = re.sub(r"\.[^.]+$", "", filename).strip() if filename else ((q_lines or ["確認テスト"])[0])
     return {"name": name, "field": field, "items": items}
 
 
@@ -1248,6 +1307,9 @@ with col_left:
             text_name = parsed["name"]
             conf_items = parsed["items"]
             st.success(f"確認テスト名: {text_name}（分野: {parsed.get('field','') or '—'}）")
+            if all(str(v).startswith("大問") for v in conf_items.values()):
+                st.warning("項目名を自動で読み取れませんでした。下の表で『項目』を入力してください"
+                           "（大問の数が違う場合は行の追加・削除もできます）。")
             _mdf = pd.DataFrame([{"大問": n, "項目（章に記録）": it} for n, it in conf_items.items()])
             _medit = st.data_editor(_mdf, num_rows="dynamic", width="stretch", key="conf_map_editor")
             # 表で項目名を修正できるように反映
