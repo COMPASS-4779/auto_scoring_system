@@ -844,37 +844,54 @@ def get_best_model(client):
 # ==========================================
 # [確認テスト] 解答付きPDF → 大問→項目 の対応表を抽出
 # ==========================================
+JP = r"[ぁ-んァ-ヶ一-龥]"
+
+def _clean_title(s):
+    s = (s or "").strip()
+    s = re.sub(r"^[\s　.．、,:：)）\]】]+", "", s)
+    m = re.search(r"【([^】]+)】", s)
+    if m: return m.group(1).strip()
+    for sep in ("：", ":"):
+        if sep in s:
+            head = s.split(sep)[0].strip()
+            if len(head) >= 2: return head
+    m = re.match(r"(.+?)(に関する|を用いて|について)", s)
+    if m: return m.group(1).strip()
+    return re.split(r"[。．]", s)[0][:28].strip()
+
 def parse_confirmation_test(pdf_bytes, filename=""):
-    """確認テストPDFから {name, field, items:{大問番号:項目名}} を返す（多様なレイアウトに対応）。"""
+    """確認テストPDF → {name, field, rows:[{unit,no,subs,title}]}"""
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     pages = [doc[i].get_text() for i in range(doc.page_count)]
-
-    # 解答・解説の手前までを「問題部」とする（無ければ全体）
     q_end = len(pages)
     for i, t in enumerate(pages):
-        if i > 0 and ("解答" in t and "解説" in t):
-            q_end = i
-            break
-    q_lines  = [ln.strip() for ln in "\n".join(pages[:q_end]).splitlines()]
+        if i > 0 and ("解答" in t or "解説" in t):
+            q_end = i; break
+    q_lines = [ln.strip() for ln in "\n".join(pages[:q_end]).splitlines()]
     all_lines = [ln.strip() for ln in "\n".join(pages).splitlines()]
 
-    # 分野（タイトル行の「（」より前）
     field = ""
     for ln in q_lines or all_lines:
         if "（" in ln and "テスト" in ln:
-            field = ln.split("（")[0].strip()
+            field = ln.split("（")[0].strip(); break
+
+    # 出題範囲：A ／ B → 単元候補
+    units = []
+    for ln in q_lines or all_lines:
+        m = re.match(r"^出題範囲[：:]\s*(.+)$", ln)
+        if m:
+            units = [u.strip() for u in re.split(r"[／/、,]", m.group(1)) if u.strip()]
             break
 
-    # 出典：NN.分野 / トピック が大問順に並ぶ（複数行に折り返す場合も連結して解析）
+    # 出典行（41-56形式）
     src_items = []
-    _src_lines = q_lines or all_lines
-    for i, ln in enumerate(_src_lines):
+    _sl = q_lines or all_lines
+    for i, ln in enumerate(_sl):
         if ln.startswith("出典"):
             buf = ln
-            for j in range(i + 1, min(i + 6, len(_src_lines))):
-                if "）" in buf or "第" in buf and "版" in buf:
-                    break
-                buf += _src_lines[j]
+            for j in range(i+1, min(i+6, len(_sl))):
+                if "）" in buf: break
+                buf += _sl[j]
             m = re.search(r"（(.+)", buf)
             inside = m.group(1) if m else buf
             for chunk in re.split(r"／", inside):
@@ -882,116 +899,96 @@ def parse_confirmation_test(pdf_bytes, filename=""):
                 if mm:
                     it = re.sub(r"[…\)）\s]+$", "", mm.group(1)).strip()
                     it = re.sub(r"\s*/\s*", " / ", it)
-                    if it:
-                        src_items.append(it)
+                    if it: src_items.append(it)
             break
 
-    JP = r"[ぁ-んァ-ヶ一-龥]"
-
-    def clean_title(s):
-        s = (s or "").strip()
-        s = re.sub(r"^[\s　.．、,:：)）\]】]+", "", s)
-        m = re.search(r"【([^】]+)】", s)
+    # ---- 単元つき（正負の数／文字式…）の走査 ----
+    rows = []
+    cur_unit = units[0] if units else ""
+    cur = None
+    unit_set = set(units)
+    for ln in q_lines:
+        if not ln: continue
+        if ln in unit_set:                      # 単元見出し
+            cur_unit = ln; cur = None; continue
+        m = re.match(r"^([0-9０-９]{1,2})\s*[\.．]\s*(.*)$", ln)   # 「1. 次の計算…」
         if m:
-            return m.group(1).strip()
-        for sep in ("：", ":"):
-            if sep in s:
-                head = s.split(sep)[0].strip()
-                if len(head) >= 2:
-                    return head
-        m = re.match(r"(.+?)(に関する|を用いて|について|に answer)", s)
-        if m:
-            return m.group(1).strip()
-        s = re.split(r"[。．]", s)[0]
-        return s[:28].strip()
+            no = int(m.group(1).translate(str.maketrans("０１２３４５６７８９","0123456789")))
+            cur = {"unit": cur_unit, "no": no, "subs": 0, "title": _clean_title(m.group(2))}
+            rows.append(cur); continue
+        if re.match(r"^[\(（]\s*[0-9０-９]{1,2}\s*[\)）]", ln) and cur:   # 小問 (1)
+            cur["subs"] += 1
+    # 単元見出しが取れない場合の保険
+    if units and not any(r["unit"] for r in rows):
+        for r in rows: r["unit"] = units[0]
+    # 出題範囲が無い形式（「1. 正の数・負の数の計算」等）は見出しをそのまま単元にする
+    if rows and not units:
+        for r in rows:
+            if not r["unit"]:
+                r["unit"] = r["title"] or f"大問{r['no']}"
 
-    def detect(lines):
-        found = {}   # n -> title
-        for i, ln in enumerate(lines):
-            if not ln:
-                continue
+    # ---- 単元が無い形式（41-56 等）は従来ロジックで大問→topic ----
+    if not rows:
+        found = {}
+        for i, ln in enumerate(q_lines or all_lines):
+            if not ln: continue
             n = None; rest = ""
-            # 第1問 / 大問1 / 問1
-            m = re.match(r"^(?:大問|第)\s*([0-9０-９]{1,2})\s*問[\.．:：、]?\s*(.*)$", ln)
-            if not m:
-                m = re.match(r"^問\s*([0-9０-９]{1,2})[\.．)）:：、]?\s*(.*)$", ln)
-            if m:
-                n = m.group(1); rest = m.group(2)
-            # 【1】
+            m = re.match(r"^(?:大問|第)\s*([0-9０-９]{1,2})\s*問[\.．:：、]?\s*(.*)$", ln) or \
+                re.match(r"^問\s*([0-9０-９]{1,2})[\.．)）:：、]?\s*(.*)$", ln)
+            if m: n, rest = m.group(1), m.group(2)
             if n is None:
                 m = re.match(r"^[【\[]\s*([0-9０-９]{1,2})\s*[】\]]\s*(.*)$", ln)
-                if m: n = m.group(1); rest = m.group(2)
-            # 1. / 1) / 1、  ＋ 日本語本文
+                if m: n, rest = m.group(1), m.group(2)
             if n is None:
                 m = re.match(r"^([0-9０-９]{1,2})\s*[\.．)）、]\s*(\S.*)$", ln)
-                if m and re.search(JP, m.group(2)):
-                    n = m.group(1); rest = m.group(2)
-            # 1 三角比の値に関する…（同一行・スペース区切り）
+                if m and re.search(JP, m.group(2)): n, rest = m.group(1), m.group(2)
             if n is None:
                 m = re.match(r"^([0-9０-９]{1,2})[ 　]+(\S.*)$", ln)
-                if m and re.search(JP, m.group(2)) and len(m.group(2)) >= 4:
-                    n = m.group(1); rest = m.group(2)
-            # 単独の数字行 → 次の日本語行を見出しに
+                if m and re.search(JP, m.group(2)) and len(m.group(2)) >= 4: n, rest = m.group(1), m.group(2)
             if n is None and re.fullmatch(r"[0-9０-９]{1,2}", ln):
                 n = ln
-                for j in range(i + 1, min(i + 4, len(lines))):
-                    nx = lines[j]
-                    if re.search(JP, nx) and len(nx) >= 4:
-                        rest = nx
-                        break
-            if n is None:
-                continue
-            num = int(str(n).translate(str.maketrans("０１２３４５６７８９", "0123456789")))
-            if not (1 <= num <= 40):
-                continue
-            title = clean_title(rest)
-            if num not in found or (not found[num] and title):
-                found[num] = title
-        # 1 から連続する範囲だけ採用（ページ番号などの誤検出を除外）
-        out = {}
-        n = 1
-        while n in found:
-            out[n] = found[n]
-            n += 1
-        return out
+                src = q_lines or all_lines
+                for j in range(i+1, min(i+4, len(src))):
+                    if re.search(JP, src[j]) and len(src[j]) >= 4: rest = src[j]; break
+            if n is None: continue
+            num = int(str(n).translate(str.maketrans("０１２３４５６７８９","0123456789")))
+            if not (1 <= num <= 40): continue
+            t = _clean_title(rest)
+            if num not in found or (not found[num] and t): found[num] = t
+        seq = {}; k = 1
+        while k in found: seq[k] = found[k]; k += 1
+        for n in range(1, max([*seq.keys(), len(src_items)] or [0]) + 1):
+            unit = src_items[n-1] if n-1 < len(src_items) else (seq.get(n) or f"大問{n}")
+            rows.append({"unit": unit, "no": n, "subs": 0, "title": seq.get(n, "")})
 
-    headings = detect(q_lines) or detect(all_lines)
+    if not rows:
+        rows = [{"unit": "", "no": n, "subs": 0, "title": ""} for n in (1, 2, 3)]
 
-    max_n = max([*headings.keys(), len(src_items)] or [0])
-    items = {}
-    for n in range(1, max_n + 1):
-        if n - 1 < len(src_items):
-            items[n] = src_items[n - 1]
-        elif headings.get(n):
-            items[n] = headings[n]
-        else:
-            items[n] = f"大問{n}"
-
-    # 何も検出できなかった場合でも空にせず、編集用の行を用意する
-    if not items:
-        items = {n: f"大問{n}" for n in range(1, 4)}
-
-    name = re.sub(r"\.[^.]+$", "", filename).strip() if filename else ((q_lines or ["確認テスト"])[0])
-    return {"name": name, "field": field, "items": items}
+    name = re.sub(r"\.[^.]+$", "", filename).strip() if filename else "確認テスト"
+    return {"name": name, "field": field, "units": units, "rows": rows}
 
 
-def save_confirm_to_spreadsheet(student_name, subject, test_name, conf_items, section_results, drive_link, creds):
-    """[確認テスト] ×印から読んだ大問・小問番号を、章＝項目 / 番号＝番号 として記録する。"""
+def save_confirm_to_spreadsheet(student_name, subject, test_name, conf_rows, section_results, drive_link, creds):
+    """[確認テスト] 単元→章 / 大問→節 / 小問→番号 として記録する。"""
     service = _sheets(creds)
     now = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    # (単元, 大問) → 小問数
+    total_map = {}
+    for r in (conf_rows or []):
+        total_map[(str(r.get("unit", "")), _to_int(r.get("no")))] = r.get("subs", 0)
     values = []
     for s in section_results:
-        daimon = str(s.get('daimon', s.get('page', ''))).strip()
-        item = conf_items.get(_to_int(daimon), s.get('section', '')) if conf_items else s.get('section', '')
-        total = s.get('total', 0)
+        unit = str(s.get('unit', '') or '').strip()
+        daimon = _to_int(s.get('daimon', s.get('page', '')))
+        total = s.get('total', 0) or total_map.get((unit, daimon), 0)
         for w in s.get('wrong', []):
+            num = str(w.get('number', '-')).strip()
             values.append([
                 now, student_name, subject, test_name,
-                daimon,          # ページ列＝大問番号
-                item,            # 章列＝項目
-                "",              # 節列は未使用
-                w.get('number', '-'),   # 番号列
-                drive_link, total, "",
+                (str(daimon) if daimon else ''),      # ページ列＝大問番号
+                unit,                                  # 章列＝単元
+                (f"大問{daimon}" if daimon else ''),   # 節列＝大問
+                num, drive_link, total, '',
             ])
     if values:
         service.spreadsheets().values().append(
@@ -1016,23 +1013,26 @@ def background_processing_task(student_name, subject_name, text_name, selected_m
             user_page = _item[2] if len(_item) > 2 else None
             try:
                 if mode == "confirm":
-                    item_list = "\n".join(f"大問{n}: {it}" for n, it in (conf_items or {}).items())
+                    lines = []
+                    for r in (conf_items or []):
+                        u = r.get("unit", ""); no = r.get("no"); sb = r.get("subs", 0)
+                        lines.append(f"単元「{u}」 大問{no}" + (f"（小問{sb}問）" if sb else ""))
+                    item_list = "\n".join(lines)
                     cprompt = (
-                        "これは採点済みの『確認テスト』答案の写真です。各小問の左側（問題番号 (1)(2) のそば）に、"
+                        "これは採点済みの『確認テスト』答案の写真です。各小問の番号のそばに、"
                         "先生が赤ペンで採点記号を付けています。この採点記号を1問ずつ判定してください。\n\n"
                         "【採点記号の意味 ＝ 最重要ルール】\n"
                         "・問題番号が赤い〇（丸・楕円）で囲まれている → その小問は【正解】。wrong に入れない。\n"
-                        "・問題番号のそばに赤い『レ点』『チェック(✓)』『斜線(／)』『×』のいずれかが付いている → その小問は【間違い】。wrong に入れる。\n"
+                        "・問題番号のそばに赤い『レ点』『チェック(✓)』『斜線(／)』『×』のいずれかが付いている → 【間違い】。wrong に入れる。\n"
+                        "・□（チェックボックス）が黒く塗りつぶされている → その小問は【間違い】。\n"
                         "・重要：赤い〇（丸）は必ず【正解】です。丸を間違いと誤認しないこと。\n"
-                        "・間違いの印は細い赤い線（レ点や斜線）で見落としやすいので、各小問を拡大するつもりで丁寧に確認する。\n"
-                        "・〇でも×系でもない無印は、正解として扱う。\n\n"
-                        "【手順】各大問（ページ上部の大きな数字 1,2,3…）の各小問について、まず〇か×系かを1つずつ判定し、"
-                        "×系（レ点/斜線/✓/×）だった小問番号 (1),(2),(ア) などだけを wrong に列挙してください。"
-                        "小問が1つだけの大問が間違いなら number は \"-\"。\n"
-                        "計算の途中式や答えの数値（例:-8, 3/4）は問題番号ではありません。\n\n"
-                        f"【この確認テストの大問構成】\n{item_list}\n\n"
-                        "【出力形式】JSON配列のみを返す（説明文は不要）。total はその大問の小問数。\n"
-                        '[{"daimon":"1","total":2,"wrong":[{"number":"(1)"}]},{"daimon":"2","total":2,"wrong":[]}]'
+                        "・〇でも×系でもなく、□も塗られていない無印は、正解として扱う。\n\n"
+                        "【この答案の構成】太字の見出しが『単元』、その下の 1. 2. 3. が『大問』、(1)(2)… が『小問』です。\n"
+                        "大問番号は単元ごとに 1 から振り直されるので、必ず『どの単元の大問か』も答えてください。\n"
+                        f"{item_list}\n\n"
+                        "【出力形式】JSON配列のみ（説明文は不要）。unit は上の単元名をそのまま使う。\n"
+                        '[{"unit":"正負の数","daimon":"1","total":4,"wrong":[{"number":"(1)"}]},'
+                        '{"unit":"文字式","daimon":"2","total":5,"wrong":[]}]'
                     )
                     ai_photo = client.files.upload(file=photo_filepath)
                     while ai_photo.state.name == 'PROCESSING':
@@ -1040,12 +1040,11 @@ def background_processing_task(student_name, subject_name, text_name, selected_m
                     response = client.models.generate_content(model=best_model, contents=[ai_photo, cprompt])
                     match = re.search(r'\[.*\]', response.text, re.DOTALL)
                     section_results = json.loads(match.group(0)) if match else []
-                    first_item = ""
-                    for s in section_results:
-                        first_item = (conf_items or {}).get(_to_int(s.get('daimon', '')), "")
-                        if first_item:
-                            break
-                    save_name = (f"[{first_item}]_".replace("/", "／") if first_item else "") + photo_name
+                    first = ""
+                    for s2 in section_results:
+                        if s2.get('wrong'):
+                            first = str(s2.get('unit', '') or ''); break
+                    save_name = (f"[{first}]_".replace("/", "／") if first else "") + photo_name
                     drive_link = upload_to_drive(photo_filepath, save_name, folder_id, creds)
                     n_saved = save_confirm_to_spreadsheet(student_name, subject_name, text_name,
                                                           conf_items, section_results, drive_link, creds)
@@ -1305,18 +1304,26 @@ with col_left:
         parsed = st.session_state.get("conf_parsed")
         if parsed:
             text_name = parsed["name"]
-            conf_items = parsed["items"]
-            st.success(f"確認テスト名: {text_name}（分野: {parsed.get('field','') or '—'}）")
-            if all(str(v).startswith("大問") for v in conf_items.values()):
-                st.warning("項目名を自動で読み取れませんでした。下の表で『項目』を入力してください"
-                           "（大問の数が違う場合は行の追加・削除もできます）。")
-            _mdf = pd.DataFrame([{"大問": n, "項目（章に記録）": it} for n, it in conf_items.items()])
+            conf_items = parsed["rows"]
+            _u = "／".join(parsed.get("units") or []) or (parsed.get("field") or "—")
+            st.success(f"確認テスト名: {text_name}（単元: {_u}）")
+            _tot = sum(int(r.get("subs") or 0) for r in conf_items)
+            if _tot:
+                st.caption(f"読み取り: {len(conf_items)} 大問 / 小問 合計 {_tot} 問")
+            if all(not str(r.get("unit", "")).strip() or str(r.get("unit", "")).startswith("大問")
+                   for r in conf_items):
+                st.warning("単元名を自動で読み取れませんでした。下の表で『単元』を入力してください"
+                           "（行の追加・削除もできます）。")
+            _mdf = pd.DataFrame([{"単元（章に記録）": r.get("unit", ""), "大問": r.get("no"),
+                                  "小問数": r.get("subs", 0)} for r in conf_items])
             _medit = st.data_editor(_mdf, num_rows="dynamic", width="stretch", key="conf_map_editor")
-            # 表で項目名を修正できるように反映
+            # 表の編集内容を反映
             try:
-                conf_items = {int(r["大問"]): str(r["項目（章に記録）"]) for _, r in _medit.iterrows()
-                              if str(r.get("大問", "")).strip() != ""}
-                st.session_state["conf_parsed"]["items"] = conf_items
+                conf_items = [{"unit": str(r["単元（章に記録）"]), "no": _to_int(r["大問"]),
+                               "subs": _to_int(r["小問数"]) or 0}
+                              for _, r in _medit.iterrows()
+                              if str(r.get("大問", "")).strip() not in ("", "None", "nan")]
+                st.session_state["conf_parsed"]["rows"] = conf_items
             except Exception:
                 pass
         else:
