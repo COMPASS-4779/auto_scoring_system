@@ -1,0 +1,11 @@
+# 認証情報（絶対にコミットしない）
+credentials.json
+client_secret*.json
+token.json
+.streamlit/secrets.toml
+*.pem
+
+# アプリが実行時に作るファイル
+master_texts/
+__pycache__/
+*.pyc

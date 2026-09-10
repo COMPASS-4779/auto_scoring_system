@@ -78,18 +78,72 @@ except Exception as e:
     st.error(f"🚨 予期せぬエラー: {e}")
     st.stop()
 
-SPREADSHEET_ID = "1B8BKKY8SfR-V3ysirsNG6fqlrVzXqPBF_AdjFDc5fCc"
-PARENT_FOLDER_ID = "1DS7anMs-ruhTtVxZNqsVhZSbeQFCww_2"
+# --- 以下の ID / メールアドレス / 生徒名は Secrets に置くことを推奨 ---
+#     Streamlit Cloud の Settings > Secrets に下記を追加すると、そちらが優先されます。
+#       SPREADSHEET_ID   = "..."      結果を書き込むスプレッドシートID
+#       PARENT_FOLDER_ID = "..."      生徒フォルダを作る Drive の親フォルダID
+#       NOTIFICATION_EMAIL = "..."    進捗通知の宛先
+#       STUDENT_SEED     = "生徒A,生徒B"  「生徒名簿」タブが空のときだけ使う初期値
+#     Secrets への移行が済んだら、下の第2引数（フォールバック値）を "" にしてください。
+def _cfg(key, default=""):
+    try:
+        v = st.secrets.get(key, "")
+    except Exception:
+        v = ""
+    return str(v).strip() or default
+
+SPREADSHEET_ID = _cfg("SPREADSHEET_ID", "1B8BKKY8SfR-V3ysirsNG6fqlrVzXqPBF_AdjFDc5fCc")
+PARENT_FOLDER_ID = _cfg("PARENT_FOLDER_ID", "1DS7anMs-ruhTtVxZNqsVhZSbeQFCww_2")
 MASTER_DIR = "master_texts"
-NOTIFICATION_EMAIL = "info@compassesonline.com"
+NOTIFICATION_EMAIL = _cfg("NOTIFICATION_EMAIL", SENDER_EMAIL)
 MASTER_TAB = "目次マスタ"  # [統合] テキスト目次マスタを保存するタブ名
 MASTER_HEADER = ["テキスト名", "章", "節", "節タイトル", "開始ページ", "終了ページ"]
 STUDENT_TAB = "生徒名簿"   # [統合] 生徒名を保存するタブ
 SUBJECT_TAB = "科目マスタ"  # [統合] 科目を保存するタブ
 DEFAULT_SUBJECTS = ["国語", "数学", "英語", "英文法", "古文", "理科", "社会"]
 
-STUDENT_LIST = ["上原百華", "上原遥人", "浅井渉", "荒木陽向", "谷川瑠依", "momokauehara"]
+# 生徒名はソースに書かない。通常はスプレッドシートの「生徒名簿」タブから読み込む。
+# STUDENT_SEED（Secrets・カンマ区切り）は、名簿タブがまだ空のときの初期値としてのみ使う。
+STUDENT_LIST = [x.strip() for x in _cfg("STUDENT_SEED").split(",") if x.strip()]
 os.makedirs(MASTER_DIR, exist_ok=True)
+
+
+# ==========================================
+# 共通ユーティリティ
+# ==========================================
+def _extract_json_array(text):
+    """Gemini の応答から最初の JSON 配列を取り出して list を返す（失敗時は []）。
+       ```json フェンス・前後の説明文・文中の別の [ ] に強い（括弧の対応を数える）。"""
+    if not text:
+        return []
+    s = str(text)
+    m = re.search(r"```(?:json)?\s*(.+?)```", s, re.DOTALL)   # コードフェンスがあれば中身を優先
+    if m:
+        s = m.group(1)
+    for start, ch in enumerate(s):
+        if ch != "[":
+            continue
+        depth, in_str, esc = 0, False, False
+        for i in range(start, len(s)):
+            c = s[i]
+            if in_str:
+                if esc:      esc = False
+                elif c == "\\": esc = True
+                elif c == '"':   in_str = False
+                continue
+            if c == '"':
+                in_str = True
+            elif c == "[":
+                depth += 1
+            elif c == "]":
+                depth -= 1
+                if depth == 0:                      # 対応する ] まで来た
+                    try:
+                        v = json.loads(s[start:i + 1])
+                    except Exception:
+                        break                       # 壊れていたら次の [ を試す
+                    return v if isinstance(v, list) else []
+    return []
 
 
 # ==========================================
@@ -703,9 +757,9 @@ def analyze_pdf_gemini(doc, text_name, api_key):
             while af.state.name == 'PROCESSING':
                 time.sleep(1); af = client.files.get(name=af.name)
             resp = client.models.generate_content(model=model, contents=[af, prompt])
-            m = re.search(r'\[.*\]', resp.text, re.DOTALL)
-            if m:
-                for o in json.loads(m.group(0)):
+            _arr = _extract_json_array(resp.text)
+            if _arr:
+                for o in _arr:
                     rows.append({"chapter": str(o.get("chapter", "")).strip(),
                                  "section": str(o.get("section", "")).strip(),
                                  "title": str(o.get("title", "")).strip(),
@@ -829,8 +883,10 @@ def process_master_file_from_path(filepath, client):
     return ai_files
 
 def get_best_model(client):
-    preferred = ['gemini-2.5-flash-preview-05-20', 'gemini-2.5-pro-exp-03-25',
-                 'gemini-2.5-flash', 'gemini-2.5-pro', 'gemini-1.5-pro-latest', 'gemini-1.5-pro']
+    # 安定版を先頭に。プレビュー版は提供終了で消えることがあるため後ろに置く。
+    preferred = ['gemini-2.5-flash', 'gemini-2.5-pro',
+                 'gemini-2.5-flash-preview-05-20', 'gemini-2.5-pro-exp-03-25',
+                 'gemini-1.5-pro-latest', 'gemini-1.5-pro']
     try:
         available = [m.name.replace('models/', '') for m in client.models.list()]
         for model in preferred:
@@ -838,7 +894,7 @@ def get_best_model(client):
                 return model
     except Exception:
         pass
-    return 'gemini-1.5-pro'
+    return 'gemini-2.5-flash'
 
 
 # ==========================================
@@ -892,11 +948,11 @@ def _vision_extract_confirm_units(doc, api_key, max_pages=60):
     rows = []
     try:
         resp = client.models.generate_content(model=model, contents=uploaded + [prompt])
-        m = re.search(r'\[.*\]', resp.text, re.DOTALL)
-        if m:
+        _arr = _extract_json_array(resp.text)
+        if _arr:
             seen = {}
             order = []
-            for o in json.loads(m.group(0)):
+            for o in _arr:
                 unit = str(o.get("unit", "")).strip()
                 no = _to_int(o.get("no"))
                 subs = _to_int(o.get("subs")) or 0
@@ -1107,8 +1163,7 @@ def background_processing_task(student_name, subject_name, text_name, selected_m
                     while ai_photo.state.name == 'PROCESSING':
                         time.sleep(1); ai_photo = client.files.get(name=ai_photo.name)
                     response = client.models.generate_content(model=best_model, contents=[ai_photo, cprompt])
-                    match = re.search(r'\[.*\]', response.text, re.DOTALL)
-                    section_results = json.loads(match.group(0)) if match else []
+                    section_results = _extract_json_array(response.text)
                     first = ""
                     for s2 in section_results:
                         if s2.get('wrong'):
@@ -1148,8 +1203,7 @@ def background_processing_task(student_name, subject_name, text_name, selected_m
                     contents = [ai_photo, prompt]
 
                 response = client.models.generate_content(model=best_model, contents=contents)
-                match = re.search(r'\[.*\]', response.text, re.DOTALL)
-                section_results = json.loads(match.group(0)) if match else []
+                section_results = _extract_json_array(response.text)
 
                 # [統合] ヘッダー（章_節_節タイトル）はユーザー入力ページから判定し、答案用紙を区別
                 ch, se, ti = lookup_section(master_index, text_name, user_page)
