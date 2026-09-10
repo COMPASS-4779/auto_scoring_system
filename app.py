@@ -16,14 +16,17 @@
 # 【モードの違い】
 #  ・テキスト  : ページ番号 → 目次マスタを逆引きして 章/節/節タイトル を自動で埋める
 #                （ファイル名の p45 等も候補にする。表の「ページから章・節を再取得」で引き直せる）
-#  ・確認テスト: 写真から 単元→章 / 大問→節・ページ / 小問→問題番号 を直接読み取る
+#  ・確認テスト: 理解度確認テスト・復習テスト等。写真から テストのタイトル(M列) と、
+#                出題元の テキスト名(D) / 章(F) / 節(G) を読み取る。章・節が印刷されて
+#                いなければ単元見出しで代替。大問番号→ページ(E)、小問→問題番号(H)
 #
 # 【テキスト目次マスタ】
 #  Google スプレッドシートの「目次マスタ」タブに永続保存（Streamlit Cloud は再起動で
 #  ファイルが消えるため）。PDF自動解析・AI画像解析・CSV登録の3通りで登録できる。
 #
-# 【結果スプレッドシートの列】 A:K
-#  日時, 生徒名, 科目, テキスト名, ページ, 章, 節, 問題番号, 写真リンク, 総問題数(小問数), 節タイトル
+# 【結果スプレッドシートの列】 A:M（L列は未使用）
+#  日時, 生徒名, 科目, テキスト名, ページ, 章, 節, 問題番号, 写真リンク, 総問題数(小問数),
+#  節タイトル, （空）, テストのタイトル
 #
 # 【Secrets】 必須: GEMINI_API_KEY / SENDER_EMAIL / APP_PASSWORD / GOOGLE_TOKEN_JSON
 #            任意: SPREADSHEET_ID / PARENT_FOLDER_ID / NOTIFICATION_EMAIL / STUDENT_SEED
@@ -828,12 +831,15 @@ def upload_to_drive(filepath, filename, folder_id, creds):
 
 def get_spreadsheet_data(creds):
     try:
-        res = _sheets(creds).spreadsheets().values().get(spreadsheetId=SPREADSHEET_ID, range='A:K').execute()
+        res = _sheets(creds).spreadsheets().values().get(spreadsheetId=SPREADSHEET_ID, range='A:M').execute()
         rows = res.get('values', [])
         if not rows:
             return pd.DataFrame()
-        header = rows[0]
-        data = [r + [''] * (len(header) - len(r)) for r in rows[1:]]
+        # 見出しより長い行（M列追加前の古い見出しなど）でも落ちないように幅を揃える
+        header = [str(h).strip() or f"列{i + 1}" for i, h in enumerate(rows[0])]
+        width = max([len(header)] + [len(r) for r in rows[1:]])
+        header += [f"列{i + 1}" for i in range(len(header), width)]
+        data = [list(r) + [''] * (width - len(r)) for r in rows[1:]]
         return pd.DataFrame(data, columns=header)
     except Exception:
         return pd.DataFrame()
@@ -877,7 +883,11 @@ def get_best_model(client):
 # ==========================================
 # 採点写真の読み取り（前面処理）→ 確認フォーム → 記録
 # ==========================================
-REVIEW_COLUMNS = ["ファイル", "テキスト名", "ページ", "章", "節", "問題番号", "小問数", "節タイトル"]
+REVIEW_COLUMNS = ["ファイル", "テキスト名", "ページ", "章", "節", "問題番号", "小問数",
+                  "節タイトル", "テストのタイトル"]
+# 結果シートの見出し（A〜M。L列は空けてある）
+RESULT_HEADER = ["日時", "生徒名", "科目", "テキスト名", "ページ", "章", "節", "問題番号",
+                 "写真リンク", "総問題数", "節タイトル", "", "テストのタイトル"]
 
 _MARK_RULES = (
     "【採点記号の意味 ＝ 最重要ルール】\n"
@@ -896,17 +906,29 @@ def _photo_prompt(mode, text_name):
     """採点済み写真から間違いを読み取らせるプロンプト（元の問題PDFは使わない）。"""
     if mode == "confirm":
         return (
-            "これは採点済みの『確認テスト』答案の写真です。赤ペンの採点記号を1問ずつ判定してください。\n\n"
+            "これは採点済みのテスト答案の写真です（理解度確認テスト・復習テストなど）。"
+            "赤ペンの採点記号を1問ずつ判定してください。\n\n"
             + _MARK_RULES +
-            "\n【答案の構成】太字・色付きの見出しが『単元』、その下の 1. 2. 3. が『大問』、"
-            "(1)(2)… が『小問』です。大問番号は単元ごとに 1 から振り直されることがあるので、"
+            "\n【答案の構成】用紙の一番上にテスト名、太字・色付きの見出しが『単元』、"
+            "その下の 1. 2. 3. が『大問』、(1)(2)… が『小問』です。"
+            "大問番号は単元ごとに 1 から振り直されることがあるので、"
             "必ず『どの単元の大問か』も答えてください。\n\n"
-            "【出力形式】JSON配列のみ（説明文は不要）。\n"
-            '[{"unit":"正負の数","daimon":"1","total":4,"wrong":[{"number":"(1)"}]}]\n'
-            "・unit   = 単元名（見出しの文字をそのまま。読めなければ \"\"）\n"
-            "・daimon = 大問番号（半角数字。読めなければ \"\"）\n"
-            "・total  = その大問に含まれる小問 (1)(2)(3)… の個数。数えられなければ 0\n"
-            "・wrong  = 間違いだった小問の番号だけを並べる（1問も無ければ空配列）"
+            "【出題元の情報も読み取る】このテストは市販テキスト・問題集から出題されています。"
+            "用紙の見出し・欄外・大問のそばに、元になったテキスト名や『第2章』『2-1』"
+            "『P.32〜』のような章・節の表記があれば、必ず読み取ってください。\n\n"
+            "【出力形式】JSON配列のみ（説明文は不要）。大問ごとに1要素。\n"
+            '[{"test_title":"第3回 理解度確認テスト","text":"新中学問題集 数学1年",'
+            '"chapter":"第2章 文字と式","section":"第1節 文字を使った式","unit":"正負の数",'
+            '"daimon":"1","total":4,"wrong":[{"number":"(1)"}]}]\n'
+            "・test_title = 用紙上部のテスト名（例:「第3回 理解度確認テスト」「復習テスト②」）。読めなければ \"\"\n"
+            "・text    = 出題元のテキスト・問題集の名前。読めなければ \"\"\n"
+            "・chapter = 出題元の章（例:「第2章 文字と式」）。書かれていなければ \"\"\n"
+            "・section = 出題元の節（例:「第1節 文字を使った式」「2-1」）。書かれていなければ \"\"\n"
+            "・unit    = 大問の上にある単元見出し。無ければ \"\"\n"
+            "・daimon  = 大問番号（半角数字。読めなければ \"\"）\n"
+            "・total   = その大問に含まれる小問 (1)(2)(3)… の個数。数えられなければ 0\n"
+            "・wrong   = 間違いだった小問の番号だけを並べる（1問も無ければ空配列）\n"
+            "推測で埋めないこと。読めない項目は必ず空文字にする。"
         )
     return (
         "これは採点済みの答案（テキスト・問題集）の写真です。赤ペンの採点記号を1問ずつ判定してください。\n\n"
@@ -931,7 +953,7 @@ def _upload_photo_to_gemini(client, photo_path):
 
 
 def analyze_photos_for_review(images, mode, text_name, master_index, api_key,
-                              selected_master_path=None, on_progress=None):
+                              selected_master_path=None, test_title="", on_progress=None):
     """採点済み写真を1枚ずつ読み取り、確認フォーム用の行リストを返す。
        この段階では Drive にもスプレッドシートにも一切書き込まない。
        戻り値: (rows, errors, 使用モデル名)"""
@@ -960,15 +982,23 @@ def analyze_photos_for_review(images, mode, text_name, master_index, api_key,
             total = _to_int(s.get("total")) or 0
             wrongs = [w for w in (s.get("wrong") or []) if isinstance(w, dict)]
             if mode == "confirm":
+                # 出題元（テキスト名・章・節）を優先。読めなければ画面で入力した既定値／単元見出しで補う
+                ttl = str(s.get("test_title", "") or "").strip() or test_title
+                src = str(s.get("text", "") or "").strip() or text_name
                 unit = str(s.get("unit", "") or "").strip()
+                ch = str(s.get("chapter", "") or "").strip()
+                se = str(s.get("section", "") or "").strip()
+                if not se:
+                    se = unit          # 節が印刷されていなければ単元見出しを節に
+                elif not ch:
+                    ch = unit          # 節はあるが章が無ければ単元見出しを章に
                 daimon = _to_int(s.get("daimon"))
                 dm = str(daimon) if daimon else ""
                 for w in wrongs:
-                    rows.append({"ファイル": name, "テキスト名": text_name,
-                                 "ページ": dm, "章": unit,
-                                 "節": (f"大問{dm}" if dm else ""),
+                    rows.append({"ファイル": name, "テキスト名": src,
+                                 "ページ": dm, "章": ch, "節": se,
                                  "問題番号": str(w.get("number", "") or "").strip(),
-                                 "小問数": total, "節タイトル": ""})
+                                 "小問数": total, "節タイトル": "", "テストのタイトル": ttl})
             else:
                 ai_ch = str(s.get("chapter", "") or "").strip()
                 ai_se = str(s.get("section", "") or "").strip()
@@ -980,11 +1010,12 @@ def analyze_photos_for_review(images, mode, text_name, master_index, api_key,
                     rows.append({"ファイル": name, "テキスト名": text_name,
                                  "ページ": page, "章": m_ch or ai_ch, "節": m_se or ai_se,
                                  "問題番号": str(w.get("number", "") or "").strip(),
-                                 "小問数": total, "節タイトル": m_ti})
+                                 "小問数": total, "節タイトル": m_ti, "テストのタイトル": ""})
         if len(rows) == n_before:
             # 読み取れなかった（または間違いが1問も無かった）→ 手入力用の空行を1行だけ置く
             rows.append({"ファイル": name, "テキスト名": text_name, "ページ": fallback_page,
-                         "章": "", "節": "", "問題番号": "", "小問数": 0, "節タイトル": ""})
+                         "章": "", "節": "", "問題番号": "", "小問数": 0, "節タイトル": "",
+                         "テストのタイトル": (test_title if mode == "confirm" else "")})
     return rows, errors, model
 
 
@@ -999,6 +1030,26 @@ def relookup_rows(rows, master_index):
             r["章"], r["節"], r["節タイトル"] = m_ch, m_se, m_ti
         out.append(r)
     return out
+
+
+def ensure_result_header(creds):
+    """結果シート1行目の見出しを確認し、M列（テストのタイトル）が無ければ書き足す。"""
+    try:
+        svc = _sheets(creds)
+        row = (svc.spreadsheets().values().get(
+            spreadsheetId=SPREADSHEET_ID, range="A1:M1").execute().get("values") or [[]])[0]
+        if len(row) >= 13 and str(row[12]).strip():
+            return
+        if not [c for c in row if str(c).strip()]:      # 見出しが空 → まとめて作る
+            svc.spreadsheets().values().update(
+                spreadsheetId=SPREADSHEET_ID, range="A1:M1",
+                valueInputOption="RAW", body={"values": [RESULT_HEADER]}).execute()
+        else:                                          # 既存の見出しは触らず M1 だけ足す
+            svc.spreadsheets().values().update(
+                spreadsheetId=SPREADSHEET_ID, range="M1",
+                valueInputOption="RAW", body={"values": [["テストのタイトル"]]}).execute()
+    except Exception as e:
+        print(f"ensure_result_header: {e}")
 
 
 def record_reviewed_rows(rows, student_name, subject_name, images, creds, on_progress=None):
@@ -1038,7 +1089,10 @@ def record_reviewed_rows(rows, student_name, subject_name, images, creds, on_pro
             now, student_name, subject_name, _s(r, "テキスト名"),
             _s(r, "ページ"), _s(r, "章"), _s(r, "節"), _s(r, "問題番号"),
             links.get(_s(r, "ファイル"), ""), (_to_int(r.get("小問数")) or 0), _s(r, "節タイトル"),
+            "",                              # L列は未使用
+            _s(r, "テストのタイトル"),         # M列
         ])
+    ensure_result_header(creds)
     _sheets(creds).spreadsheets().values().append(
         spreadsheetId=SPREADSHEET_ID, range='A1',
         valueInputOption='USER_ENTERED', body={'values': values}
@@ -1230,10 +1284,15 @@ with col_left:
 
     selected_master_path = None
     if conf_mode:
-        st.caption("採点済みの答案写真だけをアップロードしてください。写真の採点記号から"
-                   "『単元』『大問』『小問番号』『小問数』を読み取り、下の表で確認・修正してから記録します。")
-        text_name = st.text_input("確認テスト名（スプレッドシートの『テキスト名』列に入ります）")
+        st.caption("採点済みの答案写真だけをアップロードしてください。写真から『テストのタイトル』"
+                   "『出題元のテキスト名・章・節』『大問・小問番号』『小問数』を読み取り、"
+                   "下の表で確認・修正してから記録します。")
+        test_title = st.text_input("テストのタイトル（任意／例: 第3回 理解度確認テスト）",
+                                   help="M列に記録されます。写真から読み取れなかった行にこの値が入ります。")
+        text_name = st.text_input("出題元のテキスト名（任意）",
+                                  help="D列に記録されます。写真から読み取れなかった行にこの値が入ります。")
     else:
+        test_title = ""
         # [統合] テキスト名は登録済みマスタから選択可（手入力も可）
         text_options = list(master_index.keys())
         if text_options:
@@ -1276,8 +1335,8 @@ with col_left:
                    "ページ番号・章・節・問題番号・小問数は、読み取り後に下の表で確認・修正できます。")
 
     if st.button("🔍 AIで読み取る", type="primary"):
-        if not student_name or not text_name or not st.session_state.get("pending_images"):
-            st.error("生徒名・" + ("確認テスト名" if conf_mode else "テキスト名") + "・写真は必須です")
+        if not student_name or not st.session_state.get("pending_images") or (not conf_mode and not text_name):
+            st.error("生徒名と写真は必須です" + ("" if conf_mode else "（テキストモードではテキスト名も必須）"))
         else:
             _imgs = st.session_state["pending_images"]
             _bar = st.progress(0.0, text="読み取りを開始します…")
@@ -1288,7 +1347,7 @@ with col_left:
             try:
                 _rows, _errs, _model = analyze_photos_for_review(
                     _imgs, "confirm" if conf_mode else "text", text_name, master_index,
-                    GEMINI_API_KEY, selected_master_path, on_progress=_prog)
+                    GEMINI_API_KEY, selected_master_path, test_title=test_title, on_progress=_prog)
                 _bar.progress(1.0, text="読み取り完了")
                 st.session_state["review_rows"] = _rows
                 st.session_state["review_mode"] = "confirm" if conf_mode else "text"
@@ -1308,6 +1367,7 @@ with col_left:
         st.caption(f"日時: 記録時に自動で入ります　／　生徒名: **{student_name or '未選択'}**　／　"
                    f"科目: **{subject_name or '未選択'}**")
         st.caption("AIが読めなかった項目は空欄になっています。ここで入力・修正してから記録してください。"
+                   "確認テストの『テキスト名・章・節』には、写真から読み取った**出題元**が入ります。"
                    "行の追加・削除もできます。**問題番号が空の行は記録されません**"
                    "（間違いが1問も無かった写真は、空行のままにしておけば記録されません）。")
         _names = [nm for _, nm in st.session_state.get("pending_images", [])]
@@ -1325,6 +1385,8 @@ with col_left:
                 "小問数": st.column_config.NumberColumn("小問数", min_value=0, step=1,
                                                      help="その大問（項目）に含まれる問題数。総問題数の列に入ります"),
                 "節タイトル": st.column_config.TextColumn("節タイトル"),
+                "テストのタイトル": st.column_config.TextColumn(
+                    "テストのタイトル", help="M列に記録されます（理解度確認テスト・復習テストなどの名称）"),
             })
         _rows_now = _edited.to_dict("records")
 
@@ -1361,8 +1423,9 @@ with col_left:
                     else:
                         try:
                             send_notification_email_plan_b(
-                                f"【完了】{student_name} さんの記録（{text_name}）",
-                                f"科目: {subject_name}\nテキスト名: {text_name}\n記録件数: {_n}件\n\n"
+                                f"【完了】{student_name} さんの記録（{test_title or text_name}）",
+                                f"科目: {subject_name}\nテスト: {test_title}\nテキスト名: {text_name}\n"
+                                f"記録件数: {_n}件\n\n"
                                 + "\n".join(f"{k}: {v}" for k, v in _links.items()))
                         except Exception as _me:
                             st.warning(f"記録は完了しましたが、メール通知に失敗しました: {_me}")
