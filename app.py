@@ -1037,20 +1037,57 @@ def _wrong_items(s):
     return out
 
 
-def get_mark_model(client):
-    """採点記号（○・✕）の読み取り用モデル。小さな記号の見落としが少ない Pro を優先する。
-       Secrets の MARK_MODEL で指定があればそれを使う。"""
+# 採点記号の読み取りに使う Pro 系モデル（新しい順）。使えないものは自動で飛ばす。
+MARK_MODEL_CANDIDATES = ('gemini-3.1-pro-preview', 'gemini-3-pro-preview', 'gemini-2.5-pro')
+_DEAD_MODELS = set()   # このプロセスで「使えない」と分かったモデル
+
+
+def mark_model_candidates(client):
+    """採点記号（○・✕）の読み取りに使うモデルの候補（優先順）。
+       Secrets の MARK_MODEL → Pro 系 → 通常のモデル。"""
+    out = []
     forced = _cfg("MARK_MODEL", "")
     if forced:
-        return forced
+        out.append(forced)
     try:
         available = [m.name.replace('models/', '') for m in client.models.list()]
-        for model in ('gemini-2.5-pro',):
-            if model in available:
-                return model
     except Exception:
-        pass
-    return get_best_model(client)
+        available = None
+    for m in MARK_MODEL_CANDIDATES:
+        if available is None or m in available:
+            out.append(m)
+    out.append(get_best_model(client))
+    seen = set()
+    return [m for m in out if not (m in seen or seen.add(m)) and m not in _DEAD_MODELS] or [get_best_model(client)]
+
+
+def get_mark_model(client):
+    return mark_model_candidates(client)[0]
+
+
+def _is_model_unavailable(e):
+    t = str(e)
+    return any(k in t for k in ("404", "NOT_FOUND", "no longer available", "not found", "429",
+                                "RESOURCE_EXHAUSTED", "PERMISSION_DENIED", "403"))
+
+
+def generate_with_fallback(client, models, contents):
+    """models を順に試し、使えない（404・提供終了・上限超過など）ときは次のモデルへ。
+       戻り値: (使ったモデル名, レスポンス)。どれも使えなければ最後のエラーを投げる。"""
+    last = None
+    for m in models:
+        if m in _DEAD_MODELS and m != models[-1]:
+            continue
+        try:
+            return m, client.models.generate_content(model=m, contents=contents)
+        except Exception as e:
+            if not _is_model_unavailable(e):
+                raise
+            last = e
+            t = str(e)
+            if "429" not in t and "RESOURCE_EXHAUSTED" not in t:
+                _DEAD_MODELS.add(m)   # 提供終了・権限なしは以後も使わない（上限超過は一時的なので残す）
+    raise last if last else RuntimeError("使えるモデルがありません")
 
 
 def _upload_photo_to_gemini(client, photo_path):
@@ -1067,7 +1104,8 @@ def analyze_photos_for_review(images, mode, text_name, master_index, api_key,
        この段階では Drive にもスプレッドシートにも一切書き込まない。
        戻り値: (rows, errors, 使用モデル名)"""
     client = genai.Client(api_key=api_key)
-    model = get_mark_model(client)
+    models = mark_model_candidates(client)
+    model = models[0]
     ai_master_files = (process_master_file_from_path(selected_master_path, client)
                        if (mode != "confirm" and selected_master_path) else [])
     rows, errors = [], []
@@ -1079,8 +1117,9 @@ def analyze_photos_for_review(images, mode, text_name, master_index, api_key,
         n_before = len(rows)
         try:
             ai_photo = _upload_photo_to_gemini(client, path)
-            resp = client.models.generate_content(
-                model=model, contents=ai_master_files + [ai_photo, _photo_prompt(mode, text_name)])
+            model, resp = generate_with_fallback(
+                client, models, ai_master_files + [ai_photo, _photo_prompt(mode, text_name)])
+            models = [model] + [m for m in models if m != model]   # 次の写真は使えたモデルから
             result = _extract_json_array(resp.text)
         except Exception as e:
             errors.append(f"{name}: {e}")
@@ -1388,14 +1427,15 @@ def analyze_kakomon(images, api_key, default_subject="", on_progress=None, wrong
         rows.append({"写真": all_nums, "実施日": today, "学校名": "", "学部": "",
                      "科目": default_subject, "方式": "", "年度": "", "得点": None, "満点": None})
     if wrongs_out is not None:
-        mark_model = get_mark_model(client)
+        mark_models = mark_model_candidates(client)
         # 間違えた問題は1ページずつ読む（全ページをまとめて渡すと、最初の数ページしか読まれないことがあるため）
         for j, f in enumerate(uploaded):
             photo_no = idx_map[j] + 1
             if on_progress:
                 on_progress(j, len(uploaded), f"{photo_no}枚目の間違えた問題")
             try:
-                resp = client.models.generate_content(model=mark_model, contents=[f, _kakomon_wrong_prompt(photo_no, len(images))])
+                used, resp = generate_with_fallback(client, mark_models, [f, _kakomon_wrong_prompt(photo_no, len(images))])
+                mark_models = [used] + [m for m in mark_models if m != used]
                 arr = _extract_json_array(resp.text)
             except Exception as e:
                 errors.append(f"{photo_no}枚目の間違えた問題: {e}")
