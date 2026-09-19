@@ -1726,8 +1726,24 @@ def _finish(mode, imgs, msg):
     _clear_review(mode)
     st.session_state[f"up_nonce_{mode}"] = st.session_state.get(f"up_nonce_{mode}", 0) + 1
     _result_table.clear()
+    added = _remember_manual_subject()
+    if added:
+        msg += f"　科目「{added}」を科目の一覧に追加しました（次からプルダウンで選べます）。"
     st.session_state["flash"] = ("success", msg)
     st.rerun()
+
+
+def _remember_manual_subject():
+    """科目を「（手入力）」で入れて記録したら、その科目を科目マスタに追加する。追加した科目名（無ければ ""）を返す。
+    読み取っただけで記録しなかった場合は追加しない（打ち間違いを一覧に残さないため）。"""
+    if st.session_state.get("subject_pick") != "（手入力）":
+        return ""
+    name = str(st.session_state.get("subject_free") or "").strip()
+    try:
+        return name if name and add_list_item(creds_ui, SUBJECT_TAB, "科目", name) else ""
+    except Exception as e:
+        print(f"科目の追加に失敗: {e}")
+        return ""
 
 
 def render_review_form(mode, imgs, student_name, subject_name, text_name, test_title):
@@ -1892,7 +1908,8 @@ with tab_in:
         subj_pick = st.selectbox("科目" + ("（写真から読めなかったときに使います）" if mode == "kakomon" else ""),
                                  options=subjects + ["（手入力）"], index=None,
                                  placeholder="選択してください", key="subject_pick")
-        subject_name = (st.text_input("科目（手入力）", key="subject_free")
+        subject_name = (st.text_input("科目（手入力）", key="subject_free",
+                                      help="記録すると科目の一覧に追加され、次からプルダウンで選べます。")
                         if subj_pick == "（手入力）" else (subj_pick or ""))
     st.caption("生徒・科目の追加や削除は「⚙️ マスタ管理」タブで行えます。")
 
