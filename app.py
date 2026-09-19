@@ -911,7 +911,7 @@ def process_master_file_from_path(filepath, client):
     if filepath.lower().endswith('.pdf'):
         doc = fitz.open(filepath)
         for i in range(len(doc)):
-            page = doc.load_page(i); pix = page.get_pixmap(dpi=150)
+            page = doc.load_page(i); pix = page.get_pixmap(dpi=220)
             tmp = os.path.join(tempfile.gettempdir(), f"master_{uuid.uuid4().hex}.png")
             pix.save(tmp)
             try:
@@ -954,8 +954,10 @@ SUBMIT_FLAG_OLD = "弱点補強テスト実施F"   # L列の旧見出し（見�
 
 _MARK_RULES = (
     "【採点記号の意味 ＝ 最重要ルール】\n"
-    "・問題番号が赤い〇（丸・楕円）で囲まれている → その問題は【正解】。wrong に入れない。\n"
-    "・問題番号のそばに赤い『レ点』『チェック(✓)』『斜線(／)』『×』のいずれかが付いている → 【間違い】。wrong に入れる。\n"
+    "・見落とし防止：まず用紙に印刷・手書きされている問題番号を上から順に【すべて】拾い出し、"
+    "そのあと1問ずつ採点記号を確かめること。間違いだけを探すと見落とすので、正解の問題も必ず列挙する。\n"
+    "・問題番号が赤い〇（丸・楕円）で囲まれている → その問題は【正解】。\n"
+    "・問題番号のそばに赤い『レ点』『チェック(✓)』『斜線(／)』『×』のいずれかが付いている → 【間違い】。\n"
     "・□（チェックボックス）が黒く塗りつぶされている → 【間違い】。\n"
     "・解答用紙の問題番号の前（□の中や番号の左側）に ✕（バツ）が書かれている → 【間違い】。"
     "✕は赤ペンでも黒・鉛筆でも同じく【間違い】として扱う（例:「☒(1)」「✕(2)」）。\n"
@@ -984,7 +986,8 @@ def _photo_prompt(mode, text_name):
             "【出力形式】JSON配列のみ（説明文は不要）。大問ごとに1要素。\n"
             '[{"test_title":"第3回 理解度確認テスト","text":"新中学問題集 数学1年",'
             '"chapter":"第2章 文字と式","section":"第1節 文字を使った式","unit":"正負の数",'
-            '"daimon":"1","total":4,"wrong":[{"number":"(1)"}]}]\n'
+            '"daimon":"1","total":4,"items":[{"number":"(1)","mark":"x"},{"number":"(2)","mark":"o"},'
+            '{"number":"(3)","mark":"o"},{"number":"(4)","mark":"none"}]}]\n'
             "・test_title = 用紙上部のテスト名（例:「第3回 理解度確認テスト」「復習テスト②」）。読めなければ \"\"\n"
             "・text    = 出題元のテキスト・問題集の名前。読めなければ \"\"\n"
             "・chapter = 出題元の章（例:「第2章 文字と式」）。書かれていなければ \"\"\n"
@@ -992,7 +995,9 @@ def _photo_prompt(mode, text_name):
             "・unit    = 大問の上にある単元見出し。無ければ \"\"\n"
             "・daimon  = 大問番号（半角数字。読めなければ \"\"）\n"
             "・total   = その大問に含まれる小問 (1)(2)(3)… の個数。数えられなければ 0\n"
-            "・wrong   = 間違いだった小問の番号だけを並べる（1問も無ければ空配列）\n"
+            "・items   = その大問の小問を【正解も含めてすべて】上から順に並べる。"
+            "number は小問番号、mark は採点記号（\"o\"=〇で正解／\"x\"=×・✕・レ点・斜線・塗りつぶし等で間違い／"
+            "\"none\"=無印）。小さな✕や□の中の✕も拡大して確かめること\n"
             "推測で埋めないこと。読めない項目は必ず空文字にする。"
         )
     return (
@@ -1001,12 +1006,51 @@ def _photo_prompt(mode, text_name):
         "・写真内に印刷されている『ページ番号』を読み取り、page に半角数字で入れる。読めなければ \"\"。\n\n"
         "【出力形式】JSON配列のみ（説明文は不要）。\n"
         '[{"chapter":"' + str(text_name or "") + '","section":"項目名","page":"8","total":4,'
-        '"wrong":[{"page":"8","number":"(1)"}]}]\n'
+        '"items":[{"page":"8","number":"(1)","mark":"x"},{"page":"8","number":"(2)","mark":"o"}]}]\n'
         "・chapter = \"" + str(text_name or "") + "\"（固定）\n"
         "・section = その問題群の項目名（読めなければ \"\"）\n"
         "・total   = その項目に含まれる問題の総数。数えられなければ 0\n"
-        "・wrong   = 間違いだった問題だけを並べる（page と number／1問も無ければ空配列）"
+        "・items   = その項目の問題を【正解も含めてすべて】上から順に並べる（page・number・mark）。"
+        "mark は採点記号（\"o\"=〇で正解／\"x\"=×・✕・レ点・斜線・塗りつぶし等で間違い／\"none\"=無印）。"
+        "小さな✕や□の中の✕も拡大して確かめること"
     )
+
+
+_WRONG_MARKS = {"x", "×", "✕", "✖", "✗", "☒", "wrong", "ng", "false", "レ", "✓", "✔", "/", "／",
+                "斜線", "間違い", "誤", "バツ", "ばつ", "ﾊﾞﾂ"}
+
+
+def _wrong_items(s):
+    """AIの結果1件から間違えた問題（dict のリスト）を取り出す。
+       items（全問題＋採点記号）の x と、従来形式の wrong の両方を見る。重複は1つにまとめる。"""
+    out, seen = [], set()
+    cand = [w for w in (s.get("items") or []) if isinstance(w, dict)
+            and str(w.get("mark", "") or "").strip().lower() in _WRONG_MARKS]
+    cand += [w for w in (s.get("wrong") or []) if isinstance(w, dict)]
+    for w in cand:
+        key = (str(w.get("page", "") or "").strip(), str(w.get("daimon", "") or "").strip(),
+               _half(str(w.get("number", "") or "")).strip())
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(w)
+    return out
+
+
+def get_mark_model(client):
+    """採点記号（○・✕）の読み取り用モデル。小さな記号の見落としが少ない Pro を優先する。
+       Secrets の MARK_MODEL で指定があればそれを使う。"""
+    forced = _cfg("MARK_MODEL", "")
+    if forced:
+        return forced
+    try:
+        available = [m.name.replace('models/', '') for m in client.models.list()]
+        for model in ('gemini-2.5-pro',):
+            if model in available:
+                return model
+    except Exception:
+        pass
+    return get_best_model(client)
 
 
 def _upload_photo_to_gemini(client, photo_path):
@@ -1023,7 +1067,7 @@ def analyze_photos_for_review(images, mode, text_name, master_index, api_key,
        この段階では Drive にもスプレッドシートにも一切書き込まない。
        戻り値: (rows, errors, 使用モデル名)"""
     client = genai.Client(api_key=api_key)
-    model = get_best_model(client)
+    model = get_mark_model(client)
     ai_master_files = (process_master_file_from_path(selected_master_path, client)
                        if (mode != "confirm" and selected_master_path) else [])
     rows, errors = [], []
@@ -1045,7 +1089,7 @@ def analyze_photos_for_review(images, mode, text_name, master_index, api_key,
             if not isinstance(s, dict):
                 continue
             total = _to_int(s.get("total")) or 0
-            wrongs = [w for w in (s.get("wrong") or []) if isinstance(w, dict)]
+            wrongs = _wrong_items(s)
             if mode == "confirm":
                 # 出題元（テキスト名・章・節）を優先。読めなければ画面で入力した既定値／単元見出しで補う
                 ttl = str(s.get("test_title", "") or "").strip() or test_title
@@ -1283,13 +1327,15 @@ def _as_date_str(v):
 def _kakomon_wrong_prompt(page_no, n_pages):
     return (
         f"これは生徒が解いた入試の過去問の答案（採点済み）の {page_no} 枚目の写真です（全{n_pages}枚）。\n"
-        "このページに書かれた採点記号を1問ずつ判定し、間違えた問題の大問と問題番号をすべて返してください。\n\n"
+        "このページの問題を【正解も含めてすべて】列挙し、1問ずつ採点記号を判定してください（間違えた問題の大問と問題番号をすべて返して）。\n\n"
         + _MARK_RULES +
         "・×・✕・レ点・斜線などが付いた問題、解答用紙の番号の前や□に✕が書かれた問題は間違い。\n\n"
-        "【出力形式】JSON配列のみ（説明文は不要）。間違いが無ければ []。\n"
-        '[{"daimon":"Ⅰ","number":"問3"}]\n'
+        "【出力形式】JSON配列のみ（説明文は不要）。このページに問題が無ければ []。\n"
+        '[{"daimon":"Ⅰ","number":"問3","mark":"x"},{"daimon":"Ⅰ","number":"問4","mark":"o"}]\n'
         "・daimon = 大問（「Ⅰ」「1」「第2問」など用紙の表記のまま。無ければ \"\"）\n"
-        "・number = 問題番号（「問3」「(2)」など用紙の表記のまま）"
+        "・number = 問題番号（「問3」「(2)」など用紙の表記のまま）\n"
+        "・mark   = 採点記号（\"o\"=〇で正解／\"x\"=×・✕・レ点・斜線等で間違い／\"none\"=無印）。"
+        "小さな✕や□の中の✕も拡大して確かめること"
     )
 
 
@@ -1342,19 +1388,23 @@ def analyze_kakomon(images, api_key, default_subject="", on_progress=None, wrong
         rows.append({"写真": all_nums, "実施日": today, "学校名": "", "学部": "",
                      "科目": default_subject, "方式": "", "年度": "", "得点": None, "満点": None})
     if wrongs_out is not None:
+        mark_model = get_mark_model(client)
         # 間違えた問題は1ページずつ読む（全ページをまとめて渡すと、最初の数ページしか読まれないことがあるため）
         for j, f in enumerate(uploaded):
             photo_no = idx_map[j] + 1
             if on_progress:
                 on_progress(j, len(uploaded), f"{photo_no}枚目の間違えた問題")
             try:
-                resp = client.models.generate_content(model=model, contents=[f, _kakomon_wrong_prompt(photo_no, len(images))])
+                resp = client.models.generate_content(model=mark_model, contents=[f, _kakomon_wrong_prompt(photo_no, len(images))])
                 arr = _extract_json_array(resp.text)
             except Exception as e:
                 errors.append(f"{photo_no}枚目の間違えた問題: {e}")
                 continue
             exam_no = next((i + 1 for i, r in enumerate(rows)
                             if str(photo_no) in re.split(r"[,\s、，・]+", _half(str(r.get("写真") or "")))), 1)
+            # mark 付き（全問題）なら x だけ、mark の無い従来形式ならそのまま間違いとして扱う
+            arr = [w for w in arr if isinstance(w, dict) and
+                   ("mark" not in w or str(w.get("mark", "") or "").strip().lower() in _WRONG_MARKS)]
             for w in arr:
                 if isinstance(w, dict) and (str(w.get("daimon", "") or "").strip() or str(w.get("number", "") or "").strip()):
                     wrongs_out.append({"過去問": str(exam_no), "大問": str(w.get("daimon", "") or "").strip(),
@@ -1647,7 +1697,7 @@ def expand_uploaded_to_images(uploaded_file):
         elif ext == 'pdf':
             doc = fitz.open(stream=data, filetype="pdf")
             for i in range(len(doc)):
-                pix = doc.load_page(i).get_pixmap(dpi=150)
+                pix = doc.load_page(i).get_pixmap(dpi=220)
                 tmp = os.path.join(tempfile.gettempdir(), f"photo_{uuid.uuid4().hex}.png")
                 pix.save(tmp)
                 out.append((tmp, f"{name}_p{i+1}"))
