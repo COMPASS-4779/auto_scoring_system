@@ -1211,6 +1211,8 @@ def _kakomon_prompt(n_photos):
         "・year      = 過去問の年度（例: 2024。表紙や欄外の『2024年度』『令和6年度』を読む）\n"
         "・score     = 採点後の合計得点（赤字で書かれた合計点。無ければ null）\n"
         "・max_score = 満点（配点の合計。無ければ null）\n"
+        '・wrong     = 間違えた問題（赤の×・レ点・斜線などが付いた問題）の大問と問題番号。'
+        '例 [{"daimon":"Ⅰ","number":"問3"}]。無ければ []\n'
         "推測で埋めないこと。読めない項目は \"\" または null にする。"
     )
 
@@ -1278,8 +1280,9 @@ def _as_date_str(v):
     return d.isoformat() if d else str(v).strip()
 
 
-def analyze_kakomon(images, api_key, default_subject="", on_progress=None):
+def analyze_kakomon(images, api_key, default_subject="", on_progress=None, wrongs_out=None):
     """過去問の写真をまとめて読み取り、確認フォーム用の行（1行＝1回分の過去問）を返す。
+       wrongs_out にリストを渡すと、間違えた問題（KK_WRONG_COLUMNS の形）をそこへ追加する。
        この段階では Drive にもスプレッドシートにも書き込まない。戻り値: (rows, errors, 使用モデル名)"""
     client = genai.Client(api_key=api_key)
     model = get_best_model(client)
@@ -1322,14 +1325,22 @@ def analyze_kakomon(images, api_key, default_subject="", on_progress=None):
             "得点": _num(o.get("score")),
             "満点": _num(o.get("max_score")),
         })
+        if wrongs_out is not None:
+            for w in (o.get("wrong") or []):
+                if isinstance(w, dict) and (str(w.get("daimon", "") or "").strip() or str(w.get("number", "") or "").strip()):
+                    wrongs_out.append({"過去問": str(len(rows)), "大問": str(w.get("daimon", "") or "").strip(),
+                                       "問題番号": str(w.get("number", "") or "").strip(),
+                                       "分野（見出し）": "", "タイトル": ""})
     if not rows:   # 読み取れなかった → 手入力用の行を1行だけ置く
         rows.append({"写真": all_nums, "実施日": today, "学校名": "", "学部": "",
                      "科目": default_subject, "方式": "", "年度": "", "得点": None, "満点": None})
     return rows, errors, model
 
 
-def record_kakomon(rows, student_name, images, creds, on_progress=None):
+def record_kakomon(rows, student_name, images, creds, on_progress=None, wrongs=None):
     """確認フォームで確定した過去問を、写真は Drive、記録は「過去問」タブへ書き込む。
+       wrongs（間違えた問題の表）があれば、分野ごとに結果シート（1枚目）にも記録する
+       （章＝問題の先頭の見出し、節＝問題番号のタイトル、M列＝どの過去問か）。
        学校名も科目も空の行は記録しない。戻り値: (記録件数, メール用の要約行)"""
     def _s(v):
         if v is None:
@@ -1387,7 +1398,135 @@ def record_kakomon(rows, student_name, images, creds, on_progress=None):
     _sheets(creds).spreadsheets().values().append(
         spreadsheetId=SPREADSHEET_ID, range=f"{KAKOMON_TAB}!A1",
         valueInputOption='RAW', body={'values': values}).execute()
+
+    # ---- 間違えた問題 → 結果シート（分野ごとの弱点としてスケジュール管理・復習に使える）
+    wrong_values = []
+    for w in (wrongs or []):
+        idx = _to_int(w.get("過去問"))
+        exam = rows[idx - 1] if idx and 1 <= idx <= len(rows) else (valid[0] if len(valid) == 1 else None)
+        num = " ".join(x for x in (_s(w.get("大問")), _s(w.get("問題番号"))) if x)
+        if exam is None or exam not in valid or not num:
+            continue
+        yr = _norm_year(exam.get("年度"))
+        label = " ".join(x for x in (_s(exam.get("学校名")), _s(exam.get("学部")), (yr + "年度") if yr else "",
+                                     _s(exam.get("方式")), _s(exam.get("科目"))) if x)
+        links = [link_of[k] for k in _photo_nums(exam) if k in link_of]
+        wrong_values.append([now, student_name, _s(exam.get("科目")),
+                             " ".join(x for x in ("過去問", _s(exam.get("学校名")), _s(exam.get("学部"))) if x),
+                             "", _s(w.get("分野（見出し）")), _s(w.get("タイトル")), num,
+                             "\n".join(links), "", "", "", "過去問 " + label])
+    if wrong_values:
+        ensure_result_header(creds)
+        _sheets(creds).spreadsheets().values().append(
+            spreadsheetId=SPREADSHEET_ID, range='A1',
+            valueInputOption='USER_ENTERED', body={'values': wrong_values}).execute()
+        summary.append(f"間違えた問題 {len(wrong_values)} 件を分野ごとに結果シートへ記録しました")
     return len(values), summary
+
+
+# ==========================================
+# 問題（問題用紙・問題のページ）から、間違えた問題の分野を読み取る
+#   章 ＝ その問題が含まれるまとまりの先頭の見出し、節 ＝ 問題番号のところのタイトル
+# ==========================================
+KK_WRONG_COLUMNS = ["過去問", "大問", "問題番号", "分野（見出し）", "タイトル"]
+
+
+def _classify_prompt(n_pages, targets):
+    lines = "\n".join(
+        f"{t['key']}: " + " ".join(x for x in (
+            f"大問{t['daimon']}" if t.get("daimon") else "", str(t.get("number") or ""),
+            f"（p.{t['page']}）" if t.get("page") else "",
+            f"［手がかり: {t['hint']}］" if t.get("hint") else "") if x)
+        for t in targets)
+    return (
+        f"これは問題用紙（問題のページ）の画像です（全{n_pages}枚）。\n"
+        "下の一覧の各問題が問題用紙のどこにあるかを探し、その問題の分野を次の2つで答えてください。\n"
+        "・heading = その問題が含まれるまとまりの先頭にある見出し（例:「第2章 二次関数」「Ⅰ 長文読解」「文法・語法」）\n"
+        "・title   = 問題番号のところに書かれたタイトル（例:「最大・最小」「仮定法過去」）。番号だけでタイトルが無ければ \"\"\n"
+        "見出し・タイトルは用紙に書かれている文字をそのまま使い、推測で作らないこと。見つからない問題は両方 \"\" にする。\n\n"
+        f"【問題の一覧】\n{lines}\n\n"
+        "【出力形式】JSON配列のみ（説明文は不要）。\n"
+        '[{"key":"1","heading":"第2章 二次関数","title":"最大・最小"}]'
+    )
+
+
+def classify_by_questions(targets, qimages, api_key, on_progress=None):
+    """間違えた問題 targets（key・大問・問題番号・ページ・手がかり）の分野を、問題 qimages の
+       見出しとタイトルから読み取る。戻り値: ({key: (見出し, タイトル)}, errors)"""
+    if not targets or not qimages:
+        return {}, []
+    client = genai.Client(api_key=api_key)
+    model = get_best_model(client)
+    uploaded, errors = [], []
+    for i, (path, name) in enumerate(qimages):
+        if on_progress:
+            on_progress(i, len(qimages), name)
+        try:
+            uploaded.append(_upload_photo_to_gemini(client, path))
+        except Exception as e:
+            errors.append(f"{name}: {e}")
+    if not uploaded:
+        return {}, errors
+    try:
+        resp = client.models.generate_content(
+            model=model, contents=uploaded + [_classify_prompt(len(uploaded), targets)])
+        arr = _extract_json_array(resp.text)
+    except Exception as e:
+        return {}, errors + [f"分野の読み取り: {e}"]
+    out = {}
+    for o in arr:
+        if isinstance(o, dict) and str(o.get("key", "")).strip():
+            out[str(o["key"]).strip()] = (str(o.get("heading", "") or "").strip(),
+                                          str(o.get("title", "") or "").strip())
+    return out, errors
+
+
+def apply_fields_to_review_rows(rows, qimages, api_key, mode, on_progress=None):
+    """テキスト・確認テスト：間違えた問題の行に、問題から読んだ分野を入れる（章＝見出し、節＝タイトル）。
+       テキストは目次で章・節が引けた行（節タイトルあり）をそのままにし、引けなかった行だけ補う。
+       戻り値: (分野を入れた行数, errors)"""
+    targets = []
+    for i, r in enumerate(rows):
+        if not str(r.get("問題番号", "") or "").strip():
+            continue
+        if mode == "text" and str(r.get("節タイトル", "") or "").strip():
+            continue                                    # 目次で引けている
+        targets.append({"key": str(i + 1), "number": str(r.get("問題番号")),
+                        "daimon": str(r.get("ページ") or "") if mode == "confirm" else "",
+                        "page": str(r.get("ページ") or "") if mode == "text" else "",
+                        "hint": str(r.get("節") or r.get("章") or "")})
+    got, errors = classify_by_questions(targets, qimages, api_key, on_progress)
+    n = 0
+    for t in targets:
+        h, ti = got.get(t["key"], ("", ""))
+        if not (h or ti):
+            continue
+        r = rows[int(t["key"]) - 1]
+        if h:
+            r["章"] = h
+        if ti:
+            r["節"] = ti
+        n += 1
+    return n, errors
+
+
+def apply_fields_to_kakomon_wrongs(wrongs, exams, qimages, api_key, on_progress=None):
+    """過去問：間違えた問題の表に、問題冊子から読んだ分野を入れる。戻り値: (分野を入れた行数, errors)"""
+    targets = []
+    for i, w in enumerate(wrongs):
+        idx = _to_int(w.get("過去問"))
+        exam = exams[idx - 1] if idx and 1 <= idx <= len(exams) else {}
+        targets.append({"key": str(i + 1), "daimon": str(w.get("大問") or ""), "number": str(w.get("問題番号") or ""),
+                        "hint": " ".join(x for x in (str(exam.get("学校名") or ""), str(exam.get("科目") or "")) if x)})
+    got, errors = classify_by_questions(targets, qimages, api_key, on_progress)
+    n = 0
+    for t in targets:
+        h, ti = got.get(t["key"], ("", ""))
+        if h or ti:
+            wrongs[int(t["key"]) - 1]["分野（見出し）"] = h
+            wrongs[int(t["key"]) - 1]["タイトル"] = ti
+            n += 1
+    return n, errors
 
 
 LEDGER_TAB = "送付テスト"   # 宿題自動送信（LINE）で送ったテストの台帳。宿題自動送信側が書き込む
@@ -1526,6 +1665,7 @@ def _flash_show():
 def _clear_review(mode):
     if mode == "kakomon":
         st.session_state.pop("kk_rows", None)
+        st.session_state.pop("kk_wrongs", None)
     elif st.session_state.get("review_mode") == mode:
         st.session_state.pop("review_rows", None)
 
@@ -1552,14 +1692,36 @@ def _photo_uploader(mode):
     return st.session_state.get(k_imgs, [])
 
 
+def _question_uploader(mode):
+    """答案に対応する問題（問題用紙・問題のページ）の取込欄（任意）。分野の読み取りに使う。"""
+    nonce = st.session_state.get(f"up_nonce_{mode}", 0)
+    files = st.file_uploader("答案に対応する問題（問題用紙・問題のページ）※任意",
+                             type=PHOTO_TYPES, accept_multiple_files=True, key=f"qup_{mode}_{nonce}",
+                             help="取り込むと、間違えた問題ごとに、問題の先頭の見出し（→章）と"
+                                  "問題番号のタイトル（→節）から分野を読み取ります。")
+    k_imgs, k_sig = f"qimgs_{mode}", f"qsig_{mode}"
+    if files:
+        sig = tuple((f.name, f.size) for f in files)
+        if st.session_state.get(k_sig) != sig:
+            q = []
+            for f in files:
+                q.extend(expand_uploaded_to_images(f))
+            st.session_state[k_imgs] = q
+            st.session_state[k_sig] = sig
+    else:
+        st.session_state.pop(k_imgs, None)
+        st.session_state.pop(k_sig, None)
+    return st.session_state.get(k_imgs, [])
+
+
 def _finish(mode, imgs, msg):
     """記録後の後片付け：一時ファイル削除・読み取り結果の破棄・アップロード欄を空にする。"""
-    for path, _nm in imgs:
+    for path, _nm in list(imgs) + list(st.session_state.get(f"qimgs_{mode}", [])):
         try:
             os.remove(path)
         except Exception:
             pass
-    for k in (f"imgs_{mode}", f"sig_{mode}"):
+    for k in (f"imgs_{mode}", f"sig_{mode}", f"qimgs_{mode}", f"qsig_{mode}"):
         st.session_state.pop(k, None)
     _clear_review(mode)
     st.session_state[f"up_nonce_{mode}"] = st.session_state.get(f"up_nonce_{mode}", 0) + 1
@@ -1663,6 +1825,23 @@ def render_kakomon_form(imgs, student_name):
         })
     rows_now = edited.to_dict("records")
 
+    st.markdown("##### 間違えた問題（分野ごとに結果シートへ記録）")
+    st.caption("「過去問」は上の表の何行目の過去問かを表します。分野は、問題冊子を取り込むと"
+               "問題の先頭の見出し（→章）と問題番号のタイトル（→節）から読み取ります。"
+               "大問も問題番号も空の行は記録されません。")
+    wdf = pd.DataFrame(st.session_state.get("kk_wrongs") or [], columns=KK_WRONG_COLUMNS)
+    wedited = st.data_editor(
+        wdf, num_rows="dynamic", width="stretch",
+        key=f"kk_wrong_editor_{st.session_state.get('kk_ver', 0)}",
+        column_config={
+            "過去問": st.column_config.TextColumn("過去問（上の表の行番号）", help="例: 1"),
+            "大問": st.column_config.TextColumn("大問"),
+            "問題番号": st.column_config.TextColumn("問題番号"),
+            "分野（見出し）": st.column_config.TextColumn("分野（見出し）→章"),
+            "タイトル": st.column_config.TextColumn("タイトル → 節"),
+        })
+    wrongs_now = wedited.to_dict("records")
+
     c1, c2 = st.columns([1.4, 2])
     with c1:
         do_record = st.button("✅ ⑦ この内容で記録", type="primary", key="record_kakomon")
@@ -1681,7 +1860,7 @@ def render_kakomon_form(imgs, student_name):
         bar.progress(i / max(1, n), text=f"写真をDriveへ保存中 {i + 1}/{n}： {nm}")
 
     try:
-        n, summary = record_kakomon(rows_now, student_name, imgs, creds_ui, on_progress=_prog)
+        n, summary = record_kakomon(rows_now, student_name, imgs, creds_ui, on_progress=_prog, wrongs=wrongs_now)
     except Exception as e:
         bar.empty()
         st.error(f"記録エラー: {e}")
@@ -1768,6 +1947,11 @@ with tab_in:
     imgs = _photo_uploader(mode)
     if imgs:
         st.caption(f"📷 {len(imgs)} 枚（PDFは1ページ＝1枚として数えます）")
+    qimgs = _question_uploader(mode)
+    if qimgs:
+        st.caption(f"📄 問題 {len(qimgs)} 枚：間違えた問題の分野を、問題の先頭の見出し（→章）と問題番号の"
+                   "タイトル（→節）から読み取ります" + ("（目次で引けなかった問題だけ）" if mode == "text" else "")
+                   + "。取り込んだ後に変えた場合は、もう一度「AIで読み取る」を押してください。")
 
     st.markdown("**⑤ 読み取り**")
     if st.button("🔍 AIで読み取る", type="primary", key=f"read_{mode}"):
@@ -1783,14 +1967,27 @@ with tab_in:
                                                   else f"読み取り中 {i + 1}/{n}： {nm}"))
 
             try:
+                def _qprog(i, n, nm):
+                    bar.progress(i / max(1, n), text=f"問題から分野を読み取り中 {i + 1}/{n}： {nm}")
+
+                nf = None
                 if mode == "kakomon":
-                    rows, errs, used_model = analyze_kakomon(imgs, GEMINI_API_KEY, subject_name, on_progress=_prog)
+                    wrongs = []
+                    rows, errs, used_model = analyze_kakomon(imgs, GEMINI_API_KEY, subject_name,
+                                                             on_progress=_prog, wrongs_out=wrongs)
+                    if qimgs and wrongs:
+                        nf, qerrs = apply_fields_to_kakomon_wrongs(wrongs, rows, qimgs, GEMINI_API_KEY, on_progress=_qprog)
+                        errs += qerrs
                     st.session_state["kk_rows"] = rows
+                    st.session_state["kk_wrongs"] = wrongs
                     st.session_state["kk_ver"] = st.session_state.get("kk_ver", 0) + 1
                 else:
                     rows, errs, used_model = analyze_photos_for_review(
                         imgs, mode, text_name, master_index, GEMINI_API_KEY, selected_master_path,
                         test_title=test_title, on_progress=_prog)
+                    if qimgs:
+                        nf, qerrs = apply_fields_to_review_rows(rows, qimgs, GEMINI_API_KEY, mode, on_progress=_qprog)
+                        errs += qerrs
                     st.session_state["review_rows"] = rows
                     st.session_state["review_mode"] = mode
                     st.session_state["review_ver"] = st.session_state.get("review_ver", 0) + 1
@@ -1798,7 +1995,8 @@ with tab_in:
                 if errs:
                     st.warning("一部の写真で読み取りに失敗しました： " + " / ".join(errs[:3]))
                 st.info(f"使用モデル: {used_model}／{len(rows)} 行を読み取りました。"
-                        "下の表で確認し、必要なら直してから記録してください。")
+                        + (f"問題から {nf} 問の分野を読み取りました。" if nf is not None else "")
+                        + "下の表で確認し、必要なら直してから記録してください。")
             except Exception as e:
                 bar.empty()
                 st.error(f"読み取りエラー: {e}")
