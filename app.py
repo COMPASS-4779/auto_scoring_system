@@ -1,39 +1,28 @@
 # -*- coding: utf-8 -*-
 # =====================================================================
-# auto_scoring_system  app.py  ―― 採点写真だけから記録する版
+# auto_scoring_system  app.py  ―― 答案自動採点システム
+#   バージョンと更新内容は CHANGELOG.md（先頭の版を画面ヘッダーに表示）
 # =====================================================================
-# 元の問題・確認テストのPDFは不要。採点済み写真をAIが読み取り、
-# 講師が表で確認・修正してから記録する。
+# 【画面構成】 📥 取込 ／ 📊 集計結果 ／ ⚙️ マスタ管理 ／ 📜 更新履歴
 #
-# 【処理の流れ】（テキスト／確認テストの両モード共通）
-#  1. 生徒名・科目・テキスト名（確認テスト名）を選び、採点済み写真をアップロード
-#  2. 「AIで読み取る」→ Gemini が写真の赤ペン採点記号を1枚ずつ判定し、
-#     ページ／章／節／問題番号／小問数 を読み取る（この時点では何も保存しない）
-#  3. 読み取り結果を表（st.data_editor）で確認。読めなかった欄は空欄なので手入力し、
-#     行の追加・削除もできる。問題番号が空の行は記録されない
-#  4. 「この内容で記録」→ 写真を Drive に保存し、スプレッドシートへ追記してメール通知
+# 【取込の流れ】 ①種類 → ②生徒・科目 → ③種類ごとの設定 → ④写真 → ⑤AIで読み取る
+#               → ⑥表で確認・修正 → ⑦記録（ここで初めて Drive / シート / メール）
+#  ・📄 テキスト  : ページ番号 → 目次マスタを逆引きして 章/節/節タイトル を埋める
+#  ・📝 確認テスト: 理解度確認テスト・復習テスト。テストのタイトル(M列)と出題元の
+#                   テキスト名(D)/章(F)/節(G) を読み取る（無ければ単元見出しで代替）
+#  ・🎓 過去問    : 実施日・学校名・学部・科目・方式・年度・得点・満点を読み取り、
+#                   「過去問」タブへ記録。スケジュール管理のテスト結果に表示される
 #
-# 【モードの違い】
-#  ・テキスト  : ページ番号 → 目次マスタを逆引きして 章/節/節タイトル を自動で埋める
-#                （ファイル名の p45 等も候補にする。表の「ページから章・節を再取得」で引き直せる）
-#  ・確認テスト: 理解度確認テスト・復習テスト等。写真から テストのタイトル(M列) と、
-#                出題元の テキスト名(D) / 章(F) / 節(G) を読み取る。章・節が印刷されて
-#                いなければ単元見出しで代替。大問番号→ページ(E)、小問→問題番号(H)
-#
-# 【テキスト目次マスタ】
-#  Google スプレッドシートの「目次マスタ」タブに永続保存（Streamlit Cloud は再起動で
-#  ファイルが消えるため）。PDF自動解析・AI画像解析・CSV登録の3通りで登録できる。
-#
-# 【結果スプレッドシートの列】 A:M（L列は未使用）
-#  日時, 生徒名, 科目, テキスト名, ページ, 章, 節, 問題番号, 写真リンク, 総問題数(小問数),
-#  節タイトル, （空）, テストのタイトル
+# 【スプレッドシート】
+#  ・1枚目（結果）: 日時, 生徒名, 科目, テキスト名, ページ, 章, 節, 問題番号, 写真リンク,
+#                   総問題数(小問数), 節タイトル, （空）, テストのタイトル        … A:M
+#  ・過去問       : 登録日時, 生徒名, 実施日, 学校名, 学部, 科目, 方式, 年度, 得点, 満点,
+#                   写真リンク, 記録ID                                          … A:L
+#  ・目次マスタ / 生徒名簿 / 科目マスタ
+#  ※ B列＝生徒名はスケジュール管理側の照合キー（ログインID または登録氏名）
 #
 # 【Secrets】 必須: GEMINI_API_KEY / SENDER_EMAIL / APP_PASSWORD / GOOGLE_TOKEN_JSON
 #            任意: SPREADSHEET_ID / PARENT_FOLDER_ID / NOTIFICATION_EMAIL / STUDENT_SEED
-#
-# ※ 実環境（Gemini/Google認証/Streamlit）が無いため未実行です。
-#    読み取り→確認→記録のロジックはスタブを使ったテストで検証済み。
-#    デプロイ後に必ず実機で1枚テストしてください。
 # =====================================================================
 import streamlit as st
 import os
@@ -70,7 +59,13 @@ from googleapiclient.http import MediaFileUpload
 # ==========================================
 # 設定情報
 # ==========================================
-st.set_page_config(page_title="AI集計システム（逆引き統合版）", layout="wide")
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+LOGO_PATH = os.path.join(APP_DIR, "assets", "compass_logo.png")      # COMPASS online ロゴ
+MARK_PATH = os.path.join(APP_DIR, "assets", "compass_mark.png")      # ロゴの紋章部分（ファビコン）
+CHANGELOG_PATH = os.path.join(APP_DIR, "CHANGELOG.md")               # 更新履歴（バージョンの出どころ）
+
+st.set_page_config(page_title="答案自動採点システム",
+                   page_icon=(MARK_PATH if os.path.exists(MARK_PATH) else "📝"), layout="wide")
 
 missing_keys = []
 for key in ["GEMINI_API_KEY", "SENDER_EMAIL", "APP_PASSWORD", "GOOGLE_TOKEN_JSON"]:
@@ -1102,6 +1097,248 @@ def record_reviewed_rows(rows, student_name, subject_name, images, creds, on_pro
 
 
 # ==========================================
+# 🎓 過去問の取込（テキスト・確認テストとは別の取込）
+# ==========================================
+KAKOMON_TAB = "過去問"
+KAKOMON_HEADER = ["登録日時", "生徒名", "実施日", "学校名", "学部", "科目", "方式", "年度",
+                  "得点", "満点", "写真リンク", "記録ID"]
+KAKOMON_COLUMNS = ["写真", "実施日", "学校名", "学部", "科目", "方式", "年度", "得点", "満点"]
+
+
+def ensure_kakomon_tab(creds):
+    """「過去問」タブが無ければ作成し、見出し行を入れる。"""
+    svc = _sheets(creds)
+    meta = svc.spreadsheets().get(spreadsheetId=SPREADSHEET_ID).execute()
+    titles = [s['properties']['title'] for s in meta.get('sheets', [])]
+    if KAKOMON_TAB not in titles:
+        svc.spreadsheets().batchUpdate(
+            spreadsheetId=SPREADSHEET_ID,
+            body={"requests": [{"addSheet": {"properties": {"title": KAKOMON_TAB}}}]}).execute()
+        svc.spreadsheets().values().update(
+            spreadsheetId=SPREADSHEET_ID, range=f"{KAKOMON_TAB}!A1",
+            valueInputOption="RAW", body={"values": [KAKOMON_HEADER]}).execute()
+
+
+def _kakomon_prompt(n_photos):
+    return (
+        f"これは生徒が解いた入試の過去問（採点済みの答案・問題冊子）の写真です（全{n_photos}枚。"
+        "送った順に 1, 2, 3 … と番号を付けます）。\n"
+        "写真から次の情報を読み取り、JSON配列で返してください。同じ試験の複数ページは1件にまとめ、"
+        "学校・学部・科目・年度のどれかが違えば別の要素にしてください。\n\n"
+        "【出力形式】JSON配列のみ（説明文は不要）。\n"
+        '[{"photos":[1,2],"date":"2026-09-15","school":"早稲田大学","faculty":"商学部",'
+        '"subject":"英語","method":"一般選抜","year":"2024","score":72,"max_score":100}]\n'
+        "・photos    = その試験が写っている写真の番号\n"
+        "・date      = 実施日（答案に書かれた日付。YYYY-MM-DD。書かれていなければ \"\"）\n"
+        "・school    = 学校名（大学名・高校名）\n"
+        "・faculty   = 学部・学科（無ければ \"\"）\n"
+        "・subject   = 科目（例: 英語、数学IA、日本史）\n"
+        "・method    = 入試方式（例: 一般選抜、共通テスト利用、学校推薦型、前期日程、A方式。無ければ \"\"）\n"
+        "・year      = 過去問の年度（例: 2024。表紙や欄外の『2024年度』『令和6年度』を読む）\n"
+        "・score     = 採点後の合計得点（赤字で書かれた合計点。無ければ null）\n"
+        "・max_score = 満点（配点の合計。無ければ null）\n"
+        "推測で埋めないこと。読めない項目は \"\" または null にする。"
+    )
+
+
+def _parse_exam_date(v, today=None):
+    """『2026-09-15』『2026/9/15』『2026年9月15日』『9/15』→ datetime.date。読めなければ None。"""
+    today = today or datetime.date.today()
+    s = _half(str(v or "")).strip()
+    m = re.search(r"(20\d{2})\s*[-/.年]\s*(\d{1,2})\s*[-/.月]\s*(\d{1,2})", s)
+    if m:
+        y, mo, d = (int(x) for x in m.groups())
+    else:
+        m = re.search(r"(\d{1,2})\s*[/月]\s*(\d{1,2})", s)
+        if not m:
+            return None
+        y, mo, d = today.year, int(m.group(1)), int(m.group(2))
+    try:
+        return datetime.date(y, mo, d)
+    except ValueError:
+        return None
+
+
+def _norm_year(v):
+    """年度を西暦4桁に（『2024年度』→2024、『令和6年度』『R6』→2024、『平成30』→2018）。"""
+    s = _half(str(v or "")).strip()
+    if s.lower() in ("nan", "none"):
+        return ""
+    m = re.search(r"(?:19|20)\d{2}", s)
+    if m:
+        return m.group(0)
+    m = re.search(r"(?:令和|R)\s*(\d{1,2}|元)", s, re.I)
+    if m:
+        return str(2018 + (1 if m.group(1) == "元" else int(m.group(1))))
+    m = re.search(r"(?:平成|H)\s*(\d{1,2}|元)", s, re.I)
+    if m:
+        return str(1988 + (1 if m.group(1) == "元" else int(m.group(1))))
+    return s
+
+
+def _num(v):
+    """『72』『72点』『７２』→ 72.0。読めなければ None。"""
+    if v is None:
+        return None
+    s = _half(str(v)).replace(",", "").strip()
+    m = re.search(r"-?\d+(?:\.\d+)?", s)
+    return float(m.group(0)) if m else None
+
+
+def _fmt_num(v):
+    n = _num(v)
+    if n is None:
+        return ""
+    return str(int(n)) if float(n).is_integer() else str(n)
+
+
+def _as_date_str(v):
+    """表（data_editor）から戻った実施日を 'YYYY-MM-DD' に。空なら ""。"""
+    if v is None or str(v).strip().lower() in ("", "nan", "nat", "none"):
+        return ""
+    if isinstance(v, datetime.datetime):
+        return v.date().isoformat()
+    if isinstance(v, datetime.date):
+        return v.isoformat()
+    d = _parse_exam_date(v)
+    return d.isoformat() if d else str(v).strip()
+
+
+def analyze_kakomon(images, api_key, default_subject="", on_progress=None):
+    """過去問の写真をまとめて読み取り、確認フォーム用の行（1行＝1回分の過去問）を返す。
+       この段階では Drive にもスプレッドシートにも書き込まない。戻り値: (rows, errors, 使用モデル名)"""
+    client = genai.Client(api_key=api_key)
+    model = get_best_model(client)
+    uploaded, idx_map, errors = [], [], []
+    for i, (path, name) in enumerate(images):
+        if on_progress:
+            on_progress(i, len(images), name)
+        try:
+            uploaded.append(_upload_photo_to_gemini(client, path))
+            idx_map.append(i)
+        except Exception as e:
+            errors.append(f"{name}: {e}")
+    result = []
+    if uploaded:
+        try:
+            resp = client.models.generate_content(
+                model=model, contents=uploaded + [_kakomon_prompt(len(uploaded))])
+            result = _extract_json_array(resp.text)
+        except Exception as e:
+            errors.append(f"読み取り: {e}")
+    today = datetime.date.today()
+    all_nums = ",".join(str(i + 1) for i in range(len(images)))
+    rows = []
+    for o in (result or []):
+        if not isinstance(o, dict):
+            continue
+        nums = []
+        for k in (o.get("photos") or []):
+            k = _to_int(k)
+            if k and 1 <= k <= len(idx_map) and (idx_map[k - 1] + 1) not in nums:
+                nums.append(idx_map[k - 1] + 1)
+        rows.append({
+            "写真": ",".join(str(n) for n in sorted(nums)) or all_nums,
+            "実施日": _parse_exam_date(o.get("date"), today) or today,
+            "学校名": str(o.get("school", "") or "").strip(),
+            "学部": str(o.get("faculty", "") or "").strip(),
+            "科目": str(o.get("subject", "") or "").strip() or default_subject,
+            "方式": str(o.get("method", "") or "").strip(),
+            "年度": _norm_year(o.get("year")),
+            "得点": _num(o.get("score")),
+            "満点": _num(o.get("max_score")),
+        })
+    if not rows:   # 読み取れなかった → 手入力用の行を1行だけ置く
+        rows.append({"写真": all_nums, "実施日": today, "学校名": "", "学部": "",
+                     "科目": default_subject, "方式": "", "年度": "", "得点": None, "満点": None})
+    return rows, errors, model
+
+
+def record_kakomon(rows, student_name, images, creds, on_progress=None):
+    """確認フォームで確定した過去問を、写真は Drive、記録は「過去問」タブへ書き込む。
+       学校名も科目も空の行は記録しない。戻り値: (記録件数, メール用の要約行)"""
+    def _s(v):
+        if v is None:
+            return ""
+        v = str(v).strip()
+        return "" if v.lower() in ("nan", "none", "nat") else v
+
+    def _photo_nums(r):
+        out = []
+        for x in re.split(r"[,\s、，・]+", _half(_s(r.get("写真")))):
+            k = _to_int(x)
+            if k and 1 <= k <= len(images) and k not in out:
+                out.append(k)
+        return out
+
+    valid = [r for r in rows if _s(r.get("学校名")) or _s(r.get("科目"))]
+    if not valid:
+        return 0, []
+    folder_id, _ = ensure_drive_folder(student_name, creds)
+    todo, seen = [], set()
+    for r in valid:
+        for k in _photo_nums(r):
+            if k not in seen:
+                seen.add(k)
+                todo.append((k, r))
+    link_of = {}
+    for i, (k, r) in enumerate(todo):
+        path, name = images[k - 1]
+        if on_progress:
+            on_progress(i, len(todo), name)
+        yr = _norm_year(r.get("年度"))
+        head = "_".join(x for x in ("過去問", _s(r.get("学校名")), _s(r.get("学部")), _s(r.get("科目")),
+                                    (yr + "年度") if yr else "") if x)
+        link_of[k] = upload_to_drive(path, ("[" + head + "]").replace("/", "／") + "_" + name,
+                                     folder_id, creds)
+    now = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    today = datetime.date.today().isoformat()
+    values, summary = [], []
+    for r in valid:
+        links = [link_of[k] for k in _photo_nums(r) if k in link_of]
+        row = [now, student_name, _as_date_str(r.get("実施日")) or today,
+               _s(r.get("学校名")), _s(r.get("学部")), _s(r.get("科目")), _s(r.get("方式")),
+               _norm_year(r.get("年度")), _fmt_num(r.get("得点")), _fmt_num(r.get("満点")),
+               "\n".join(links), uuid.uuid4().hex[:12]]
+        values.append(row)
+        score = (row[8] + ("/" + row[9] if row[9] else "") + "点") if row[8] else "得点なし"
+        summary.append(f"{row[2]} {row[3]} {row[4]} {row[5]} {row[6]} "
+                       f"{(row[7] + '年度') if row[7] else ''} … {score}\n  " + " ".join(links))
+    ensure_kakomon_tab(creds)
+    # 文字列のまま保存（RAW）し、列ごとの型を揃える（スケジュール管理側の CSV 取込で値が欠けないように）
+    _sheets(creds).spreadsheets().values().append(
+        spreadsheetId=SPREADSHEET_ID, range=f"{KAKOMON_TAB}!A1",
+        valueInputOption='RAW', body={'values': values}).execute()
+    return len(values), summary
+
+
+def get_kakomon_data(creds):
+    """「過去問」タブを DataFrame で返す（無ければ空）。"""
+    try:
+        rows = _sheets(creds).spreadsheets().values().get(
+            spreadsheetId=SPREADSHEET_ID, range=f"{KAKOMON_TAB}!A:L").execute().get('values', [])
+        if len(rows) < 2:
+            return pd.DataFrame()
+        width = len(rows[0])
+        return pd.DataFrame([(list(r) + [''] * width)[:width] for r in rows[1:]], columns=rows[0])
+    except Exception:
+        return pd.DataFrame()
+
+
+# ==========================================
+# 更新履歴・バージョン（CHANGELOG.md をサーバー上の正とする）
+# ==========================================
+def load_changelog():
+    """CHANGELOG.md を読み、(全文, 最新バージョン, 更新日) を返す。無ければ空文字。"""
+    try:
+        text = io.open(CHANGELOG_PATH, encoding="utf-8").read()
+    except Exception:
+        return "", "", ""
+    m = re.search(r"^##\s*v?(\d+(?:\.\d+)*)\s*[—–-]+\s*(\d{4}-\d{2}-\d{2})", text, re.M)
+    return text, (m.group(1) if m else ""), (m.group(2) if m else "")
+
+
+# ==========================================
 # [統合] アップロード(画像/PDF/Word) → 画像群に展開
 # ==========================================
 def expand_uploaded_to_images(uploaded_file):
@@ -1145,307 +1382,469 @@ def expand_uploaded_to_images(uploaded_file):
 # ==========================================
 # Streamlit Web UI
 # ==========================================
-st.title("📝 採点済みプリント 自動集計システム（逆引き統合版）")
-
-# ---- PDFから目次マスタを登録（逆引きアプリのPDF解析を統合） ----
-with st.expander("📄 PDFから目次マスタを登録（自動解析→確認・修正→登録）", expanded=False):
-    _creds_pdf = Credentials.from_authorized_user_info(GOOGLE_TOKEN_DICT)
-    pdf_up = st.file_uploader("テキストのPDF", type=["pdf"], key="pdf_master_up")
-    pdf_name_in = st.text_input("登録テキスト名（空欄ならファイル名）", key="pdf_name_in")
-    use_gemini = st.checkbox("🤖 AI画像解析（Gemini）を使う（文字化けPDF・複雑な目次向け／高精度）", key="pdf_use_gemini")
-    if pdf_up is not None and st.button("🔎 PDFを解析"):
-        try:
-            _doc = fitz.open(stream=pdf_up.getvalue(), filetype="pdf")
-            _name = (pdf_name_in or "").strip() or pdf_up.name.rsplit(".", 1)[0]
-            if use_gemini:
-                _rows, _method = analyze_pdf_gemini(_doc, _name, GEMINI_API_KEY)
-            else:
-                _rows, _method = analyze_pdf(_doc, _name)
-                if (not _rows) or _method.startswith("解析不可"):
-                    try:
-                        gr, gm = analyze_pdf_gemini(_doc, _name, GEMINI_API_KEY)
-                        if gr:
-                            _rows, _method = gr, gm + "（自動切替）"
-                    except Exception as ge:
-                        st.warning(f"AI画像解析に失敗: {ge}")
-            st.session_state["pdf_rows"] = _rows
-            st.session_state["pdf_name"] = _name
-            st.session_state["pdf_method"] = _method
-            st.success(f"{len(_rows)} 件抽出しました（方式: {_method}）。下の表で確認・修正して登録してください。")
-        except Exception as e:
-            st.error(f"解析エラー: {e}")
-    if st.session_state.get("pdf_rows"):
-        st.caption(f"テキスト名: {st.session_state['pdf_name']} ／ 方式: {st.session_state.get('pdf_method','')}")
-        _df = pd.DataFrame([{ "章": r.get("chapter", ""), "節": r.get("section", ""),
-                              "節タイトル": r.get("title", ""), "開始ページ": r.get("start"),
-                              "終了ページ": r.get("end") } for r in st.session_state["pdf_rows"]])
-        _edited = st.data_editor(_df, num_rows="dynamic", width="stretch", key="pdf_editor")
-        if st.button("✅ このテキストを目次マスタに登録", type="primary"):
-            try:
-                _out = _edited.copy()
-                _out.insert(0, "テキスト名", st.session_state["pdf_name"])
-                _csv = _out.to_csv(index=False).encode("utf-8-sig")
-                n_t, n_r = register_master_csv(_creds_pdf, _csv)
-                st.success(f"目次マスタに登録しました（{n_t} テキスト / {n_r} 行）。")
-                for k in ("pdf_rows", "pdf_name", "pdf_method"):
-                    st.session_state.pop(k, None)
-                st.rerun()
-            except Exception as e:
-                st.error(f"登録エラー: {e}")
-
-
 creds_ui = Credentials.from_authorized_user_info(GOOGLE_TOKEN_DICT)
 master_index = load_master_index(creds_ui)  # [統合] Sheetから常時参照
 students = load_list(creds_ui, STUDENT_TAB, "生徒名", STUDENT_LIST)   # [統合] 生徒名簿
 subjects = load_list(creds_ui, SUBJECT_TAB, "科目", DEFAULT_SUBJECTS)  # [統合] 科目マスタ
+APP_CHANGELOG, APP_VERSION, APP_UPDATED = load_changelog()
 
-# ---- サイドバー：テキスト目次マスタ管理 ----
-with st.sidebar:
-    st.subheader("📚 テキスト目次マスタ")
-    if master_index:
-        st.success("登録済みテキスト：\n- " + "\n- ".join(master_index.keys()))
+KIND_LABELS = {"text": "📄 テキスト", "confirm": "📝 確認テスト", "kakomon": "🎓 過去問"}
+KIND_HELP = {
+    "text": "テキスト・問題集の答案。ページ番号から目次マスタを逆引きして、章・節を記録します。",
+    "confirm": "理解度確認テスト・復習テストの答案。テストのタイトルと出題元のテキスト名・章・節を写真から読み取ります。",
+    "kakomon": "入試過去問の答案。実施日・学校名・学部・科目・方式・年度・得点を読み取り、"
+               "スケジュール管理（schedule.compassonline.site）のテスト結果に表示します。",
+}
+PHOTO_TYPES = ['jpg', 'jpeg', 'png', 'heic', 'heif', 'pdf', 'docx', 'doc']
+
+# ---- ヘッダー：ロゴ・システム名・バージョン ----
+_hl, _hr = st.columns([1, 4])
+with _hl:
+    if os.path.exists(LOGO_PATH):
+        st.image(LOGO_PATH, width=170)
+with _hr:
+    st.markdown(
+        "<div style='padding-top:14px'>"
+        "<span style='font-size:1.8rem;font-weight:800'>答案自動採点システム</span>"
+        "<span style='margin-left:12px;padding:3px 12px;border-radius:999px;background:#0A1628;"
+        f"color:#C9A24A;font-size:.85rem;font-weight:700;vertical-align:middle'>Ver. {APP_VERSION or '―'}</span>"
+        + (f"<div style='opacity:.65;font-size:.8rem;margin-top:4px'>最終更新 {APP_UPDATED}"
+           "　／　更新内容は「📜 更新履歴」タブ</div>" if APP_UPDATED else "")
+        + "</div>", unsafe_allow_html=True)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _result_table(_creds, which):
+    """集計結果の表（1分キャッシュ。記録・更新ボタンで破棄）。"""
+    return get_kakomon_data(_creds) if which == "kakomon" else get_spreadsheet_data(_creds)
+
+
+def _flash_show():
+    f = st.session_state.pop("flash", None)
+    if f:
+        getattr(st, f[0])(f[1])
+        if f[0] == "success":
+            st.balloons()
+
+
+def _clear_review(mode):
+    if mode == "kakomon":
+        st.session_state.pop("kk_rows", None)
+    elif st.session_state.get("review_mode") == mode:
+        st.session_state.pop("review_rows", None)
+
+
+def _photo_uploader(mode):
+    """種類ごとに独立したアップロード欄。内容が変わった時だけ画像へ展開（PDF=各ページ、Word=埋め込み画像）。"""
+    nonce = st.session_state.get(f"up_nonce_{mode}", 0)
+    files = st.file_uploader("採点済みの写真／PDF／Word（複数可・iPhoneのHEICも可）",
+                             type=PHOTO_TYPES, accept_multiple_files=True, key=f"up_{mode}_{nonce}")
+    k_imgs, k_sig = f"imgs_{mode}", f"sig_{mode}"
+    if files:
+        sig = tuple((f.name, f.size) for f in files)
+        if st.session_state.get(k_sig) != sig:
+            imgs = []
+            for f in files:
+                imgs.extend(expand_uploaded_to_images(f))
+            st.session_state[k_imgs] = imgs          # [(path, name), ...]
+            st.session_state[k_sig] = sig
+            _clear_review(mode)                     # 写真が変わったら読み取り結果は破棄
     else:
-        st.warning("未登録です。逆引きアプリの『マスタを書き出す』で出力したCSVを登録してください。")
-    ups = st.file_uploader("目次CSV を登録（複数可・章節リストCSVも可）", type=["csv"],
-                           accept_multiple_files=True, key="master_csv")
-    st.caption("テキスト名の列が無いCSV（例: 『〇〇_章節リスト.csv』）は、ファイル名をテキスト名として登録します。")
-    if ups and st.button("⬆️ マスタに登録（目次マスタタブへ保存）"):
-        tot_t, tot_r, errs = 0, 0, []
-        for up in ups:
-            try:
-                dn = _text_name_from_filename(up.name)
-                nt, nr = register_master_csv(creds_ui, up.getvalue(), default_text_name=dn)
-                tot_t += nt; tot_r += nr
-            except Exception as e:
-                errs.append(f"{up.name}: {e}")
-        if tot_r:
-            st.success(f"{tot_t} テキスト / {tot_r} 行を登録しました。")
-        if errs:
-            st.error("一部失敗： " + " / ".join(errs))
-        st.rerun()
+        st.session_state.pop(k_imgs, None)
+        st.session_state.pop(k_sig, None)
+        _clear_review(mode)
+    return st.session_state.get(k_imgs, [])
 
-    st.divider()
-    st.subheader("👤 生徒名の管理")
-    ns = st.text_input("生徒名を追加", key="new_student")
-    if st.button("➕ 生徒を追加"):
-        _nm = (ns or "").strip()
-        if not _nm:
-            st.warning("生徒名を入力してください")
-        else:
-            add_list_item(creds_ui, STUDENT_TAB, "生徒名", _nm)   # 名簿へ（重複は無視）
-            try:
-                _fid, _created = ensure_drive_folder(_nm, creds_ui)
-                st.success(f"「{_nm}」を追加しました（Driveフォルダ：{'新規作成' if _created else '既存を使用'}）")
-            except Exception as _e:
-                st.warning(f"名簿には追加しましたが、Driveフォルダ作成でエラー: {_e}")
+
+def _finish(mode, imgs, msg):
+    """記録後の後片付け：一時ファイル削除・読み取り結果の破棄・アップロード欄を空にする。"""
+    for path, _nm in imgs:
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+    for k in (f"imgs_{mode}", f"sig_{mode}"):
+        st.session_state.pop(k, None)
+    _clear_review(mode)
+    st.session_state[f"up_nonce_{mode}"] = st.session_state.get(f"up_nonce_{mode}", 0) + 1
+    _result_table.clear()
+    st.session_state["flash"] = ("success", msg)
+    st.rerun()
+
+
+def render_review_form(mode, imgs, student_name, subject_name, text_name, test_title):
+    """⑥ テキスト・確認テストの読み取り結果の確認・修正 → ⑦ 記録。"""
+    st.markdown("#### ⑥ 読み取り結果の確認・修正")
+    st.caption(f"日時: 記録時に自動で入ります　／　生徒名: **{student_name or '未選択'}**　／　"
+               f"科目: **{subject_name or '未選択'}**")
+    st.caption("AIが読めなかった項目は空欄です。ここで入力・修正してから記録してください。行の追加・削除もできます。"
+               + ("確認テストの『テキスト名・章・節』には、写真から読み取った**出題元**が入ります。"
+                  if mode == "confirm" else "")
+               + "**問題番号が空の行は記録されません**（全問正解の写真は空行のままで構いません）。")
+    names = [nm for _, nm in imgs]
+    df = pd.DataFrame(st.session_state["review_rows"], columns=REVIEW_COLUMNS)
+    edited = st.data_editor(
+        df, num_rows="dynamic", width="stretch",
+        key=f"review_editor_{st.session_state.get('review_ver', 0)}",
+        column_config={
+            "ファイル": st.column_config.SelectboxColumn("ファイル（写真）", options=names, width="medium"),
+            "テキスト名": st.column_config.TextColumn("テキスト名"),
+            "ページ": st.column_config.TextColumn("ページ", help="確認テストでは大問番号が入ります"),
+            "章": st.column_config.TextColumn("章"),
+            "節": st.column_config.TextColumn("節"),
+            "問題番号": st.column_config.TextColumn("問題番号", help="間違えた問題の番号。空欄の行は記録されません"),
+            "小問数": st.column_config.NumberColumn("小問数", min_value=0, step=1,
+                                                 help="その大問（項目）に含まれる問題数。総問題数の列に入ります"),
+            "節タイトル": st.column_config.TextColumn("節タイトル"),
+            "テストのタイトル": st.column_config.TextColumn(
+                "テストのタイトル", help="M列に記録されます（理解度確認テスト・復習テストなどの名称）"),
+        })
+    rows_now = edited.to_dict("records")
+
+    c1, c2, c3 = st.columns([1.4, 1, 1])
+    with c1:
+        do_record = st.button("✅ ⑦ この内容で記録", type="primary", key=f"record_{mode}")
+    with c2:
+        if mode == "text" and st.button("📖 ページから章・節を再取得", key="relookup"):
+            st.session_state["review_rows"] = relookup_rows(rows_now, master_index)
+            st.session_state["review_ver"] = st.session_state.get("review_ver", 0) + 1
             st.rerun()
-    ds = st.selectbox("削除する生徒", options=["（選択）"] + students, key="del_student")
-    if st.button("🗑 生徒を削除") and ds and ds != "（選択）":
-        remove_list_item(creds_ui, STUDENT_TAB, "生徒名", ds); st.success("削除しました"); st.rerun()
+    with c3:
+        if st.button("✖ 破棄", key=f"discard_{mode}"):
+            _clear_review(mode)
+            st.rerun()
+    if not do_record:
+        return
+    if not student_name:
+        st.error("生徒名を選んでください")
+        return
+    bar = st.progress(0.0, text="記録を開始します…")
 
-    st.divider()
-    st.subheader("📕 科目の管理")
-    nsub = st.text_input("科目を追加", key="new_subject")
-    if st.button("➕ 科目を追加"):
-        if add_list_item(creds_ui, SUBJECT_TAB, "科目", nsub):
-            st.success("追加しました"); st.rerun()
-        else:
-            st.warning("空欄、または既に登録済みです")
-    dsub = st.selectbox("削除する科目", options=["（選択）"] + subjects, key="del_subject")
-    if st.button("🗑 科目を削除") and dsub and dsub != "（選択）":
-        remove_list_item(creds_ui, SUBJECT_TAB, "科目", dsub); st.success("削除しました"); st.rerun()
+    def _prog(i, n, nm):
+        bar.progress(i / max(1, n), text=f"写真をDriveへ保存中 {i + 1}/{n}： {nm}")
 
-col_left, col_right = st.columns([1, 1])
+    try:
+        n, links = record_reviewed_rows(rows_now, student_name, subject_name, imgs, creds_ui,
+                                        on_progress=_prog)
+    except Exception as e:
+        bar.empty()
+        st.error(f"記録エラー: {e}")
+        return
+    if n == 0:
+        bar.empty()
+        st.warning("問題番号が入力された行がないため、記録しませんでした。")
+        return
+    send_notification_email_plan_b(
+        f"【完了】{student_name} さんの記録（{test_title or text_name}）",
+        f"種類: {KIND_LABELS[mode]}\n科目: {subject_name}\nテスト: {test_title}\nテキスト名: {text_name}\n"
+        f"記録件数: {n}件\n\n" + "\n".join(f"{k}: {v}" for k, v in links.items()))
+    _finish(mode, imgs, f"✅ {n} 件を記録しました（写真 {len(links)} 枚を Drive に保存）。")
 
-with col_left:
-    st.subheader("👤 講師用アップロード画面")
-    student_name = st.selectbox("生徒名", options=students, index=None)
-    with st.expander("＋ 新しい生徒を追加（Driveフォルダも自動作成）"):
-        _ns2 = st.text_input("生徒名", key="new_student_main")
-        if st.button("追加してフォルダ作成", key="add_student_main"):
-            _nm2 = (_ns2 or "").strip()
-            if not _nm2:
-                st.warning("生徒名を入力してください")
-            else:
-                add_list_item(creds_ui, STUDENT_TAB, "生徒名", _nm2)
-                try:
-                    _fid2, _c2 = ensure_drive_folder(_nm2, creds_ui)
-                    st.success(f"「{_nm2}」を追加（Driveフォルダ：{'新規作成' if _c2 else '既存を使用'}）")
-                except Exception as _e2:
-                    st.warning(f"名簿追加OK・Driveフォルダ作成でエラー: {_e2}")
-                st.rerun()
-    subj_pick = st.selectbox("科目", options=subjects + ["（手入力）"], index=None)
-    subject_name = st.text_input("科目（手入力）") if subj_pick == "（手入力）" else (subj_pick or "")
-    # ---- 採点モード切替 ----
-    grade_mode = st.radio("採点モード",
-                          ["📄 テキスト（ページ番号→章/節）", "📝 確認テスト（単元・大問）"],
-                          horizontal=True)
-    conf_mode = grade_mode.startswith("📝")
 
-    selected_master_path = None
-    if conf_mode:
-        st.caption("採点済みの答案写真だけをアップロードしてください。写真から『テストのタイトル』"
-                   "『出題元のテキスト名・章・節』『大問・小問番号』『小問数』を読み取り、"
-                   "下の表で確認・修正してから記録します。")
-        test_title = st.text_input("テストのタイトル（任意／例: 第3回 理解度確認テスト）",
-                                   help="M列に記録されます。写真から読み取れなかった行にこの値が入ります。")
-        text_name = st.text_input("出題元のテキスト名（任意）",
-                                  help="D列に記録されます。写真から読み取れなかった行にこの値が入ります。")
-    else:
-        test_title = ""
-        # [統合] テキスト名は登録済みマスタから選択可（手入力も可）
+def render_kakomon_form(imgs, student_name):
+    """⑥ 過去問の読み取り結果の確認・修正 → ⑦ 記録。"""
+    st.markdown("#### ⑥ 読み取り結果の確認・修正（過去問）")
+    st.caption(f"生徒名: **{student_name or '未選択'}**　／　1行＝1回分の過去問です（学校・学部・科目・年度ごと）。"
+               "読めなかった項目は空欄なので入力してください。実施日は、答案に書かれていなければ今日の日付が入っています。"
+               "**学校名も科目も空の行は記録されません。**")
+    with st.expander(f"📷 写真の番号（{len(imgs)} 枚）"):
+        st.markdown("\n".join(f"{i + 1}. {nm}" for i, (_, nm) in enumerate(imgs)))
+    df = pd.DataFrame(st.session_state["kk_rows"], columns=KAKOMON_COLUMNS)
+    for c in ("得点", "満点"):
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    edited = st.data_editor(
+        df, num_rows="dynamic", width="stretch",
+        key=f"kk_editor_{st.session_state.get('kk_ver', 0)}",
+        column_config={
+            "写真": st.column_config.TextColumn("写真番号", help="この過去問が写っている写真の番号（例: 1,2）"),
+            "実施日": st.column_config.DateColumn("実施日", format="YYYY-MM-DD"),
+            "学校名": st.column_config.TextColumn("学校名"),
+            "学部": st.column_config.TextColumn("学部・学科"),
+            "科目": st.column_config.TextColumn("科目"),
+            "方式": st.column_config.TextColumn("方式", help="一般選抜・共通テスト利用・学校推薦型・前期日程・A方式 など"),
+            "年度": st.column_config.TextColumn("年度", help="過去問の年度（例: 2024）。令和・平成は西暦に直して記録します"),
+            "得点": st.column_config.NumberColumn("得点", min_value=0),
+            "満点": st.column_config.NumberColumn("満点", min_value=0),
+        })
+    rows_now = edited.to_dict("records")
+
+    c1, c2 = st.columns([1.4, 2])
+    with c1:
+        do_record = st.button("✅ ⑦ この内容で記録", type="primary", key="record_kakomon")
+    with c2:
+        if st.button("✖ 破棄", key="discard_kakomon"):
+            _clear_review("kakomon")
+            st.rerun()
+    if not do_record:
+        return
+    if not student_name:
+        st.error("生徒名を選んでください")
+        return
+    bar = st.progress(0.0, text="記録を開始します…")
+
+    def _prog(i, n, nm):
+        bar.progress(i / max(1, n), text=f"写真をDriveへ保存中 {i + 1}/{n}： {nm}")
+
+    try:
+        n, summary = record_kakomon(rows_now, student_name, imgs, creds_ui, on_progress=_prog)
+    except Exception as e:
+        bar.empty()
+        st.error(f"記録エラー: {e}")
+        return
+    if n == 0:
+        bar.empty()
+        st.warning("学校名・科目が入力された行がないため、記録しませんでした。")
+        return
+    send_notification_email_plan_b(f"【完了】{student_name} さんの過去問記録（{n}件）", "\n\n".join(summary))
+    _finish("kakomon", imgs, f"✅ 過去問 {n} 件を記録しました。スケジュール管理のテスト結果には、"
+                             "生徒がダッシュボードを開いたとき（またはスプレッドシート取込ボタン）に反映されます。")
+
+
+_flash_show()   # 記録・登録などの完了メッセージ（どのタブで操作しても見えるようタブの外に出す）
+tab_in, tab_res, tab_master, tab_log = st.tabs(["📥 取込", "📊 集計結果", "⚙️ マスタ管理", "📜 更新履歴"])
+
+# ================================================================== 📥 取込
+with tab_in:
+    mode = st.radio("① 取込の種類", options=list(KIND_LABELS), format_func=KIND_LABELS.get,
+                    horizontal=True, key="kind")
+    st.caption(KIND_HELP[mode])
+
+    st.markdown("**② 生徒・科目**")
+    _c1, _c2 = st.columns(2)
+    with _c1:
+        student_name = st.selectbox("生徒名", options=students, index=None,
+                                    placeholder="選択してください", key="student_pick")
+    with _c2:
+        subj_pick = st.selectbox("科目" + ("（写真から読めなかったときに使います）" if mode == "kakomon" else ""),
+                                 options=subjects + ["（手入力）"], index=None,
+                                 placeholder="選択してください", key="subject_pick")
+        subject_name = (st.text_input("科目（手入力）", key="subject_free")
+                        if subj_pick == "（手入力）" else (subj_pick or ""))
+    st.caption("生徒・科目の追加や削除は「⚙️ マスタ管理」タブで行えます。")
+
+    selected_master_path, text_name, test_title = None, "", ""
+    if mode == "text":
+        st.markdown("**③ テキスト**")
         text_options = list(master_index.keys())
         if text_options:
-            picked = st.selectbox("テキスト名（マスタから選択／逆引き対象）", options=text_options + ["（手入力）"], index=None)
-            text_name = st.text_input("テキスト名（手入力）") if picked == "（手入力）" else (picked or "")
+            picked = st.selectbox("テキスト名（目次マスタから選択）", options=text_options + ["（手入力）"],
+                                  index=None, placeholder="選択してください", key="text_pick")
+            text_name = (st.text_input("テキスト名（手入力）", key="text_free")
+                         if picked == "（手入力）" else (picked or ""))
         else:
-            text_name = st.text_input("テキスト名")
-
-        master_option = st.radio("マスターテキスト（採点比較用の画像/PDF）", ["💾 保存済みを使う", "🆕 新規アップロード", "❌ 指定しない"])
-        if master_option == "💾 保存済みを使う":
-            master_files = [f for f in os.listdir(MASTER_DIR) if f.endswith(('.pdf', '.png', '.jpg'))]
-            if master_files:
-                selected_master_path = os.path.join(MASTER_DIR, st.selectbox("テキストを選択", master_files))
-        elif master_option == "🆕 新規アップロード":
-            um = st.file_uploader("マスターPDF/画像", type=['pdf', 'jpg', 'png'])
-            if um:
-                selected_master_path = os.path.join(MASTER_DIR, um.name)
-                with open(selected_master_path, "wb") as f: f.write(um.getvalue())
-
-    uploaded_photos = st.file_uploader("採点済み写真／PDF／Word（複数可・iPhoneのHEICも可）",
-                                       type=['jpg', 'jpeg', 'png', 'heic', 'heif', 'pdf', 'docx', 'doc'],
-                                       accept_multiple_files=True)
-
-    # [統合] アップロード内容が変わった時だけ画像へ展開（PDF=各ページ、Word=埋め込み画像）
-    if uploaded_photos:
-        sig = tuple((f.name, f.size) for f in uploaded_photos)
-        if st.session_state.get("img_sig") != sig:
-            imgs = []
-            for f in uploaded_photos:
-                imgs.extend(expand_uploaded_to_images(f))
-            st.session_state["pending_images"] = imgs   # [(path, name), ...]
-            st.session_state["img_sig"] = sig
-            st.session_state.pop("review_rows", None)   # 画像が変わったら読み取り結果は破棄
+            text_name = st.text_input("テキスト名", key="text_free")
+            st.caption("目次マスタが未登録のため、章・節の逆引きはできません（「⚙️ マスタ管理」で登録できます）。")
+        with st.expander("詳細設定：採点比較用のマスター画像/PDF（任意）"):
+            master_option = st.radio("マスターテキスト", ["💾 保存済みを使う", "🆕 新規アップロード", "❌ 指定しない"],
+                                     horizontal=True, key="master_opt")
+            if master_option == "💾 保存済みを使う":
+                master_files = [f for f in os.listdir(MASTER_DIR) if f.endswith(('.pdf', '.png', '.jpg'))]
+                if master_files:
+                    selected_master_path = os.path.join(MASTER_DIR, st.selectbox("テキストを選択", master_files,
+                                                                                 key="master_saved"))
+                else:
+                    st.caption("保存済みのマスターはありません。")
+            elif master_option == "🆕 新規アップロード":
+                um = st.file_uploader("マスターPDF/画像", type=['pdf', 'jpg', 'png'], key="master_up")
+                if um:
+                    selected_master_path = os.path.join(MASTER_DIR, um.name)
+                    with open(selected_master_path, "wb") as f:
+                        f.write(um.getvalue())
+        if selected_master_path:
+            st.caption(f"採点比較用マスター: {os.path.basename(selected_master_path)}")
+    elif mode == "confirm":
+        st.markdown("**③ テストの情報（任意）**")
+        _c3, _c4 = st.columns(2)
+        with _c3:
+            test_title = st.text_input("テストのタイトル", placeholder="例: 第3回 理解度確認テスト", key="test_title",
+                                       help="M列に記録されます。写真から読み取れなかった行にこの値が入ります。")
+        with _c4:
+            text_name = st.text_input("出題元のテキスト名", key="conf_text",
+                                      help="D列に記録されます。写真から読み取れなかった行にこの値が入ります。")
     else:
-        for k in ("pending_images", "img_sig", "review_rows"):
-            st.session_state.pop(k, None)
+        st.markdown("**③ 過去問の情報**")
+        st.caption("実施日・学校名・学部・科目・方式・年度・得点は写真から読み取るので、ここでの入力は不要です。"
+                   "読み取り後の表で確認・修正できます。")
 
-    if st.session_state.get("pending_images"):
-        st.caption(f"📷 {len(st.session_state['pending_images'])} 枚を読み取ります。"
-                   "ページ番号・章・節・問題番号・小問数は、読み取り後に下の表で確認・修正できます。")
+    st.markdown("**④ 採点済みの写真**")
+    imgs = _photo_uploader(mode)
+    if imgs:
+        st.caption(f"📷 {len(imgs)} 枚（PDFは1ページ＝1枚として数えます）")
 
-    if st.button("🔍 AIで読み取る", type="primary"):
-        if not student_name or not st.session_state.get("pending_images") or (not conf_mode and not text_name):
-            st.error("生徒名と写真は必須です" + ("" if conf_mode else "（テキストモードではテキスト名も必須）"))
+    st.markdown("**⑤ 読み取り**")
+    if st.button("🔍 AIで読み取る", type="primary", key=f"read_{mode}"):
+        missing = [label for label, ok in (("生徒名", student_name), ("写真", imgs),
+                                           ("テキスト名", text_name or mode != "text")) if not ok]
+        if missing:
+            st.error("・".join(missing) + " を入力してください")
         else:
-            _imgs = st.session_state["pending_images"]
-            _bar = st.progress(0.0, text="読み取りを開始します…")
+            bar = st.progress(0.0, text="読み取りを開始します…")
 
             def _prog(i, n, nm):
-                _bar.progress(i / max(1, n), text=f"読み取り中 {i + 1}/{n}： {nm}")
+                bar.progress(i / max(1, n), text=(f"写真を送信中 {i + 1}/{n}： {nm}" if mode == "kakomon"
+                                                  else f"読み取り中 {i + 1}/{n}： {nm}"))
 
             try:
-                _rows, _errs, _model = analyze_photos_for_review(
-                    _imgs, "confirm" if conf_mode else "text", text_name, master_index,
-                    GEMINI_API_KEY, selected_master_path, test_title=test_title, on_progress=_prog)
-                _bar.progress(1.0, text="読み取り完了")
-                st.session_state["review_rows"] = _rows
-                st.session_state["review_mode"] = "confirm" if conf_mode else "text"
-                st.session_state["review_ver"] = st.session_state.get("review_ver", 0) + 1
-                if _errs:
-                    st.warning("一部の写真で読み取りに失敗しました： " + " / ".join(_errs[:3]))
-                st.info(f"使用モデル: {_model}／{len(_rows)} 行を読み取りました。"
-                        "内容を確認し、必要なら直してから記録してください。")
+                if mode == "kakomon":
+                    rows, errs, used_model = analyze_kakomon(imgs, GEMINI_API_KEY, subject_name, on_progress=_prog)
+                    st.session_state["kk_rows"] = rows
+                    st.session_state["kk_ver"] = st.session_state.get("kk_ver", 0) + 1
+                else:
+                    rows, errs, used_model = analyze_photos_for_review(
+                        imgs, mode, text_name, master_index, GEMINI_API_KEY, selected_master_path,
+                        test_title=test_title, on_progress=_prog)
+                    st.session_state["review_rows"] = rows
+                    st.session_state["review_mode"] = mode
+                    st.session_state["review_ver"] = st.session_state.get("review_ver", 0) + 1
+                bar.progress(1.0, text="読み取り完了")
+                if errs:
+                    st.warning("一部の写真で読み取りに失敗しました： " + " / ".join(errs[:3]))
+                st.info(f"使用モデル: {used_model}／{len(rows)} 行を読み取りました。"
+                        "下の表で確認し、必要なら直してから記録してください。")
             except Exception as e:
-                _bar.empty()
+                bar.empty()
                 st.error(f"読み取りエラー: {e}")
 
-    # ---- 読み取り結果の確認・修正フォーム ----
-    if st.session_state.get("review_rows") is not None:
+    if mode == "kakomon" and st.session_state.get("kk_rows") is not None:
         st.divider()
-        st.markdown("### ✍️ 読み取り結果の確認・修正")
-        st.caption(f"日時: 記録時に自動で入ります　／　生徒名: **{student_name or '未選択'}**　／　"
-                   f"科目: **{subject_name or '未選択'}**")
-        st.caption("AIが読めなかった項目は空欄になっています。ここで入力・修正してから記録してください。"
-                   "確認テストの『テキスト名・章・節』には、写真から読み取った**出題元**が入ります。"
-                   "行の追加・削除もできます。**問題番号が空の行は記録されません**"
-                   "（間違いが1問も無かった写真は、空行のままにしておけば記録されません）。")
-        _names = [nm for _, nm in st.session_state.get("pending_images", [])]
-        _df = pd.DataFrame(st.session_state["review_rows"], columns=REVIEW_COLUMNS)
-        _edited = st.data_editor(
-            _df, num_rows="dynamic", width="stretch",
-            key=f"review_editor_{st.session_state.get('review_ver', 0)}",
-            column_config={
-                "ファイル": st.column_config.SelectboxColumn("ファイル（写真）", options=_names, width="medium"),
-                "テキスト名": st.column_config.TextColumn("テキスト名"),
-                "ページ": st.column_config.TextColumn("ページ", help="確認テストでは大問番号が入ります"),
-                "章": st.column_config.TextColumn("章", help="確認テストでは単元名が入ります"),
-                "節": st.column_config.TextColumn("節", help="確認テストでは「大問N」が入ります"),
-                "問題番号": st.column_config.TextColumn("問題番号", help="間違えた問題の番号。空欄の行は記録されません"),
-                "小問数": st.column_config.NumberColumn("小問数", min_value=0, step=1,
-                                                     help="その大問（項目）に含まれる問題数。総問題数の列に入ります"),
-                "節タイトル": st.column_config.TextColumn("節タイトル"),
-                "テストのタイトル": st.column_config.TextColumn(
-                    "テストのタイトル", help="M列に記録されます（理解度確認テスト・復習テストなどの名称）"),
-            })
-        _rows_now = _edited.to_dict("records")
+        render_kakomon_form(imgs, student_name)
+    elif (mode != "kakomon" and st.session_state.get("review_rows") is not None
+          and st.session_state.get("review_mode") == mode):
+        st.divider()
+        render_review_form(mode, imgs, student_name, subject_name, text_name, test_title)
 
-        c1, c2, c3 = st.columns([1.4, 1, 1])
-        with c1:
-            _record = st.button("✅ この内容で記録", type="primary")
-        with c2:
-            if st.session_state.get("review_mode") == "text":
-                if st.button("📖 ページから章・節を再取得"):
-                    st.session_state["review_rows"] = relookup_rows(_rows_now, master_index)
-                    st.session_state["review_ver"] = st.session_state.get("review_ver", 0) + 1
+# ================================================================== 📊 集計結果
+with tab_res:
+    if st.button("🔄 最新のデータを読み込む", key="refresh_results"):
+        _result_table.clear()
+    _r1, _r2 = st.tabs(["📝 採点記録（テキスト・確認テスト）", "🎓 過去問"])
+    with _r1:
+        _df = _result_table(creds_ui, "result")
+        if _df.empty:
+            st.info("まだ記録がありません。")
+        else:
+            st.dataframe(_df.iloc[::-1], height=600, width="stretch")
+    with _r2:
+        _kdf = _result_table(creds_ui, "kakomon")
+        if _kdf.empty:
+            st.info("まだ過去問の記録がありません。")
+        else:
+            st.dataframe(_kdf.iloc[::-1], height=600, width="stretch")
+
+# ================================================================== ⚙️ マスタ管理
+with tab_master:
+    _m1, _m2, _m3, _m4 = st.tabs(["📚 目次マスタ（PDFから）", "📚 目次マスタ（CSVから）", "👤 生徒", "📕 科目"])
+
+    with _m1:   # ---- PDFから目次マスタを登録（逆引きアプリのPDF解析を統合） ----
+        st.caption("テキストのPDFを解析して目次（章・節・ページ）を取り出し、確認・修正してから登録します。")
+        pdf_up = st.file_uploader("テキストのPDF", type=["pdf"], key="pdf_master_up")
+        pdf_name_in = st.text_input("登録テキスト名（空欄ならファイル名）", key="pdf_name_in")
+        use_gemini = st.checkbox("🤖 AI画像解析（Gemini）を使う（文字化けPDF・複雑な目次向け／高精度）",
+                                 key="pdf_use_gemini")
+        if pdf_up is not None and st.button("🔎 PDFを解析", key="pdf_analyze"):
+            try:
+                _doc = fitz.open(stream=pdf_up.getvalue(), filetype="pdf")
+                _name = (pdf_name_in or "").strip() or pdf_up.name.rsplit(".", 1)[0]
+                if use_gemini:
+                    _rows, _method = analyze_pdf_gemini(_doc, _name, GEMINI_API_KEY)
+                else:
+                    _rows, _method = analyze_pdf(_doc, _name)
+                    if (not _rows) or _method.startswith("解析不可"):
+                        try:
+                            gr, gm = analyze_pdf_gemini(_doc, _name, GEMINI_API_KEY)
+                            if gr:
+                                _rows, _method = gr, gm + "（自動切替）"
+                        except Exception as ge:
+                            st.warning(f"AI画像解析に失敗: {ge}")
+                st.session_state["pdf_rows"] = _rows
+                st.session_state["pdf_name"] = _name
+                st.session_state["pdf_method"] = _method
+                st.success(f"{len(_rows)} 件抽出しました（方式: {_method}）。下の表で確認・修正して登録してください。")
+            except Exception as e:
+                st.error(f"解析エラー: {e}")
+        if st.session_state.get("pdf_rows"):
+            st.caption(f"テキスト名: {st.session_state['pdf_name']} ／ 方式: {st.session_state.get('pdf_method', '')}")
+            _pdf_df = pd.DataFrame([{"章": r.get("chapter", ""), "節": r.get("section", ""),
+                                     "節タイトル": r.get("title", ""), "開始ページ": r.get("start"),
+                                     "終了ページ": r.get("end")} for r in st.session_state["pdf_rows"]])
+            _pdf_edited = st.data_editor(_pdf_df, num_rows="dynamic", width="stretch", key="pdf_editor")
+            if st.button("✅ このテキストを目次マスタに登録", type="primary", key="pdf_register"):
+                try:
+                    _out = _pdf_edited.copy()
+                    _out.insert(0, "テキスト名", st.session_state["pdf_name"])
+                    n_t, n_r = register_master_csv(creds_ui, _out.to_csv(index=False).encode("utf-8-sig"))
+                    for k in ("pdf_rows", "pdf_name", "pdf_method"):
+                        st.session_state.pop(k, None)
+                    st.session_state["flash"] = ("success", f"目次マスタに登録しました（{n_t} テキスト / {n_r} 行）。")
                     st.rerun()
-        with c3:
-            if st.button("✖ 破棄"):
-                st.session_state.pop("review_rows", None)
+                except Exception as e:
+                    st.error(f"登録エラー: {e}")
+
+    with _m2:   # ---- 目次CSVから登録 ----
+        if master_index:
+            st.success("登録済みテキスト：\n- " + "\n- ".join(master_index.keys()))
+        else:
+            st.warning("未登録です。逆引きアプリの『マスタを書き出す』で出力したCSVを登録してください。")
+        ups = st.file_uploader("目次CSV を登録（複数可・章節リストCSVも可）", type=["csv"],
+                               accept_multiple_files=True, key="master_csv")
+        st.caption("テキスト名の列が無いCSV（例: 『〇〇_章節リスト.csv』）は、ファイル名をテキスト名として登録します。")
+        if ups and st.button("⬆️ マスタに登録（目次マスタタブへ保存）", key="csv_register"):
+            tot_t, tot_r, errs = 0, 0, []
+            for up in ups:
+                try:
+                    nt, nr = register_master_csv(creds_ui, up.getvalue(),
+                                                 default_text_name=_text_name_from_filename(up.name))
+                    tot_t += nt
+                    tot_r += nr
+                except Exception as e:
+                    errs.append(f"{up.name}: {e}")
+            if errs:
+                st.error("一部失敗： " + " / ".join(errs))
+            elif tot_r:
+                st.session_state["flash"] = ("success", f"{tot_t} テキスト / {tot_r} 行を登録しました。")
                 st.rerun()
 
-        if _record:
-            if not student_name:
-                st.error("生徒名を選んでください")
+    with _m3:   # ---- 生徒 ----
+        _ns = st.text_input("生徒名を追加", key="new_student",
+                            help="スケジュール管理のログインID（または登録氏名）と同じ表記にしてください。")
+        if st.button("➕ 追加して Drive フォルダを作成", key="add_student"):
+            _nm = (_ns or "").strip()
+            if not _nm:
+                st.warning("生徒名を入力してください")
             else:
-                _bar2 = st.progress(0.0, text="記録を開始します…")
-
-                def _prog2(i, n, nm):
-                    _bar2.progress(i / max(1, n), text=f"写真をDriveへ保存中 {i + 1}/{n}： {nm}")
-
+                add_list_item(creds_ui, STUDENT_TAB, "生徒名", _nm)   # 名簿へ（重複は無視）
                 try:
-                    _n, _links = record_reviewed_rows(_rows_now, student_name, subject_name,
-                                                      st.session_state.get("pending_images", []),
-                                                      creds_ui, on_progress=_prog2)
-                    _bar2.progress(1.0, text="記録完了")
-                    if _n == 0:
-                        st.warning("問題番号が入力された行がないため、記録しませんでした。")
-                    else:
-                        try:
-                            send_notification_email_plan_b(
-                                f"【完了】{student_name} さんの記録（{test_title or text_name}）",
-                                f"科目: {subject_name}\nテスト: {test_title}\nテキスト名: {text_name}\n"
-                                f"記録件数: {_n}件\n\n"
-                                + "\n".join(f"{k}: {v}" for k, v in _links.items()))
-                        except Exception as _me:
-                            st.warning(f"記録は完了しましたが、メール通知に失敗しました: {_me}")
-                        for _p, _nm in st.session_state.get("pending_images", []):
-                            try:
-                                os.remove(_p)
-                            except Exception:
-                                pass
-                        for k in ("review_rows", "review_mode", "pending_images", "img_sig"):
-                            st.session_state.pop(k, None)
-                        st.success(f"✅ {_n} 件を記録しました（写真 {len(_links)} 枚を Drive に保存）。")
-                        st.balloons()
-                except Exception as e:
-                    _bar2.empty()
-                    st.error(f"記録エラー: {e}")
+                    _fid, _created = ensure_drive_folder(_nm, creds_ui)
+                    st.session_state["flash"] = ("success", f"「{_nm}」を追加しました"
+                                                 f"（Driveフォルダ：{'新規作成' if _created else '既存を使用'}）")
+                except Exception as _e:
+                    st.session_state["flash"] = ("warning", f"名簿には追加しましたが、Driveフォルダ作成でエラー: {_e}")
+                st.rerun()
+        _ds = st.selectbox("削除する生徒", options=["（選択）"] + students, key="del_student")
+        if st.button("🗑 生徒を削除", key="del_student_btn") and _ds and _ds != "（選択）":
+            remove_list_item(creds_ui, STUDENT_TAB, "生徒名", _ds)
+            st.session_state["flash"] = ("success", f"「{_ds}」を名簿から削除しました（Driveのフォルダは残ります）")
+            st.rerun()
 
+    with _m4:   # ---- 科目 ----
+        _nsub = st.text_input("科目を追加", key="new_subject")
+        if st.button("➕ 科目を追加", key="add_subject"):
+            if add_list_item(creds_ui, SUBJECT_TAB, "科目", _nsub):
+                st.session_state["flash"] = ("success", "科目を追加しました")
+                st.rerun()
+            else:
+                st.warning("空欄、または既に登録済みです")
+        _dsub = st.selectbox("削除する科目", options=["（選択）"] + subjects, key="del_subject")
+        if st.button("🗑 科目を削除", key="del_subject_btn") and _dsub and _dsub != "（選択）":
+            remove_list_item(creds_ui, SUBJECT_TAB, "科目", _dsub)
+            st.session_state["flash"] = ("success", f"「{_dsub}」を削除しました")
+            st.rerun()
 
-with col_right:
-    st.subheader("📊 現在の集計結果")
-    if st.button("🔄 データを更新"): st.rerun()
-    df = get_spreadsheet_data(creds_ui)
-    if not df.empty:
-        st.dataframe(df.iloc[::-1], height=600, width='stretch')
+# ================================================================== 📜 更新履歴
+with tab_log:
+    if APP_CHANGELOG:
+        st.caption(f"現在のバージョン: Ver. {APP_VERSION}（{APP_UPDATED} 更新）　／　"
+                   "サーバー上の CHANGELOG.md を表示しています。")
+        st.markdown(APP_CHANGELOG)
+    else:
+        st.info("CHANGELOG.md が見つかりません。")
