@@ -1390,6 +1390,22 @@ def record_kakomon(rows, student_name, images, creds, on_progress=None):
     return len(values), summary
 
 
+LEDGER_TAB = "送付テスト"   # 宿題自動送信（LINE）で送ったテストの台帳。宿題自動送信側が書き込む
+
+
+def get_ledger_data(creds):
+    """「送付テスト」タブ（送付日時・生徒名・テスト名・テストID・処理F・提出F・正解率・状態など）を返す。"""
+    try:
+        rows = _sheets(creds).spreadsheets().values().get(
+            spreadsheetId=SPREADSHEET_ID, range=f"{LEDGER_TAB}!A:R").execute().get('values', [])
+        if len(rows) < 2:
+            return pd.DataFrame()
+        width = len(rows[0])
+        return pd.DataFrame([(list(r) + [''] * width)[:width] for r in rows[1:]], columns=rows[0])
+    except Exception:
+        return pd.DataFrame()
+
+
 def get_kakomon_data(creds):
     """「過去問」タブを DataFrame で返す（無ければ空）。"""
     try:
@@ -1494,6 +1510,8 @@ with _hr:
 @st.cache_data(ttl=60, show_spinner=False)
 def _result_table(_creds, which):
     """集計結果の表（1分キャッシュ。記録・更新ボタンで破棄）。"""
+    if which == "ledger":
+        return get_ledger_data(_creds)
     return get_kakomon_data(_creds) if which == "kakomon" else get_spreadsheet_data(_creds)
 
 
@@ -1797,7 +1815,7 @@ with tab_in:
 with tab_res:
     if st.button("🔄 最新のデータを読み込む", key="refresh_results"):
         _result_table.clear()
-    _r1, _r2 = st.tabs(["📝 採点記録（テキスト・確認テスト）", "🎓 過去問"])
+    _r1, _r2, _r3 = st.tabs(["📝 採点記録（テキスト・確認テスト）", "🎓 過去問", "📨 送付テスト（提出状況）"])
     with _r1:
         _df = _result_table(creds_ui, "result")
         if _df.empty:
@@ -1810,6 +1828,17 @@ with tab_res:
             st.info("まだ過去問の記録がありません。")
         else:
             st.dataframe(_kdf.iloc[::-1], height=600, width="stretch")
+    with _r3:
+        st.caption("テスト作成システムから LINE で送った理解度確認テスト・復習テスト・過去問の一覧です。"
+                   "送付した時点で処理F=1、答案が届くと提出F=1 になり、正解率と状態が更新されます（宿題自動送信が自動で記録）。")
+        _ldf = _result_table(creds_ui, "ledger")
+        if _ldf.empty:
+            st.info("まだ LINE で送付したテストはありません。")
+        else:
+            _only = st.checkbox("未提出だけ表示", key="ledger_unsubmitted")
+            if _only and "提出F" in _ldf.columns:
+                _ldf = _ldf[_ldf["提出F"].astype(str).str.strip() != "1"]
+            st.dataframe(_ldf.iloc[::-1], height=600, width="stretch", hide_index=True)
 
 # ================================================================== ⚙️ マスタ管理
 with tab_master:
