@@ -818,6 +818,73 @@ def ensure_drive_folder(student_name, creds):
         fields='id').execute()
     return created.get('id'), True
 
+DONE_FOLDER = "実施済答案"      # 生徒フォルダの下に作る、答案写真の保存先
+
+
+def _find_or_create_folder(service, name, parent_id):
+    safe = str(name).replace("\\", "\\\\").replace("'", "\\'")
+    q = (f"'{parent_id}' in parents and name = '{safe}' "
+         "and mimeType = 'application/vnd.google-apps.folder' and trashed = false")
+    hit = service.files().list(q=q, fields="files(id)").execute().get('files', [])
+    if hit:
+        return hit[0]['id']
+    return service.files().create(
+        body={'name': name, 'mimeType': 'application/vnd.google-apps.folder', 'parents': [parent_id]},
+        fields='id').execute().get('id')
+
+
+def ensure_done_folder(student_name, creds):
+    """生徒フォルダの下の「実施済答案」フォルダ（無ければ作成）の ID を返す。答案写真はすべてここへ保存する。"""
+    student_folder, _ = ensure_drive_folder(student_name, creds)
+    return _find_or_create_folder(build('drive', 'v3', credentials=creds), DONE_FOLDER, student_folder)
+
+
+def _list_children(service, parent_id, extra_q=""):
+    """フォルダ直下の子（ページングを辿って全件）を返す。"""
+    out, token = [], None
+    while True:
+        res = service.files().list(
+            q=f"'{parent_id}' in parents and trashed = false" + extra_q,
+            fields="nextPageToken, files(id, name, mimeType)", pageSize=1000, pageToken=token).execute()
+        out.extend(res.get('files', []))
+        token = res.get('nextPageToken')
+        if not token:
+            return out
+
+
+def plan_move_to_done(creds):
+    """各生徒フォルダの直下に置かれた答案写真（画像ファイル）を洗い出す。
+       戻り値: [{"student", "folder_id", "files": [{"id", "name"}]}]（対象がある生徒のみ）"""
+    svc = build('drive', 'v3', credentials=creds)
+    plan = []
+    folders = _list_children(svc, PARENT_FOLDER_ID, " and mimeType = 'application/vnd.google-apps.folder'")
+    for f in sorted(folders, key=lambda x: x.get('name', '')):
+        files = [c for c in _list_children(svc, f['id'], " and mimeType contains 'image/'")]
+        if files:
+            plan.append({"student": f['name'], "folder_id": f['id'],
+                         "files": [{"id": c['id'], "name": c['name']} for c in files]})
+    return plan
+
+
+def move_to_done(plan, creds, on_progress=None):
+    """plan_move_to_done の結果に沿って、写真を各生徒の「実施済答案」へ移動する。戻り値: (移動件数, エラー一覧)"""
+    svc = build('drive', 'v3', credentials=creds)
+    total = sum(len(p["files"]) for p in plan)
+    done, errors = 0, []
+    for p in plan:
+        dest = _find_or_create_folder(svc, DONE_FOLDER, p["folder_id"])
+        for f in p["files"]:
+            if on_progress:
+                on_progress(done + len(errors), total, f"{p['student']} / {f['name']}")
+            try:
+                svc.files().update(fileId=f["id"], addParents=dest,
+                                   removeParents=p["folder_id"], fields="id").execute()
+                done += 1
+            except Exception as e:
+                errors.append(f"{p['student']} / {f['name']}: {e}")
+    return done, errors
+
+
 def upload_to_drive(filepath, filename, folder_id, creds):
     service = build('drive', 'v3', credentials=creds)
     media = MediaFileUpload(filepath, mimetype='image/jpeg', resumable=True)
@@ -882,7 +949,8 @@ REVIEW_COLUMNS = ["ファイル", "テキスト名", "ページ", "章", "節", 
                   "節タイトル", "テストのタイトル"]
 # 結果シートの見出し（A〜M。L列は空けてある）
 RESULT_HEADER = ["日時", "生徒名", "科目", "テキスト名", "ページ", "章", "節", "問題番号",
-                 "写真リンク", "総問題数", "節タイトル", "", "テストのタイトル"]
+                 "写真リンク", "総問題数", "節タイトル", "提出F", "テストのタイトル"]
+SUBMIT_FLAG_OLD = "弱点補強テスト実施F"   # L列の旧見出し（見つけたら「提出F」に改名する）
 
 _MARK_RULES = (
     "【採点記号の意味 ＝ 最重要ルール】\n"
@@ -1028,11 +1096,16 @@ def relookup_rows(rows, master_index):
 
 
 def ensure_result_header(creds):
-    """結果シート1行目の見出しを確認し、M列（テストのタイトル）が無ければ書き足す。"""
+    """結果シート1行目の見出しを確認する。L列の旧見出し「弱点補強テスト実施F」は「提出F」に改名し、
+       M列（テストのタイトル）が無ければ書き足す。"""
     try:
         svc = _sheets(creds)
         row = (svc.spreadsheets().values().get(
             spreadsheetId=SPREADSHEET_ID, range="A1:M1").execute().get("values") or [[]])[0]
+        if len(row) >= 12 and str(row[11]).strip() == SUBMIT_FLAG_OLD:
+            svc.spreadsheets().values().update(
+                spreadsheetId=SPREADSHEET_ID, range="L1",
+                valueInputOption="RAW", body={"values": [["提出F"]]}).execute()
         if len(row) >= 13 and str(row[12]).strip():
             return
         if not [c for c in row if str(c).strip()]:      # 見出しが空 → まとめて作る
@@ -1047,9 +1120,12 @@ def ensure_result_header(creds):
         print(f"ensure_result_header: {e}")
 
 
-def record_reviewed_rows(rows, student_name, subject_name, images, creds, on_progress=None):
-    """確認フォームで確定した行を Drive（写真）とスプレッドシートへ記録する。
-       問題番号が空の行は記録しない。戻り値: (記録件数, {ファイル名: 写真リンク})"""
+def record_reviewed_rows(rows, student_name, subject_name, images, creds, on_progress=None,
+                         submit_flag=False):
+    """確認フォームで確定した行をスプレッドシートへ記録し、写真は正解・不正解にかかわらず
+       すべて生徒の「実施済答案」フォルダへ保存する。問題番号が空の行はシートには書かない。
+       submit_flag=True なら L列（提出F）に 1 を立てる（送付した理解度確認テストの答案）。
+       戻り値: (記録件数, {ファイル名: 写真リンク})"""
     def _s(r, k):
         v = r.get(k, "")
         if v is None:
@@ -1058,25 +1134,23 @@ def record_reviewed_rows(rows, student_name, subject_name, images, creds, on_pro
         return "" if v.lower() in ("nan", "none") else v
 
     valid = [r for r in rows if _s(r, "問題番号") not in ("", "-")]
-    if not valid:
-        return 0, {}
-    folder_id, _ = ensure_drive_folder(student_name, creds)
-    path_of = {name: path for path, name in images}
-    links, targets, seen = {}, [], set()
+    folder_id = ensure_done_folder(student_name, creds)
+    first_row = {}                     # 写真ごとの代表行（ファイル名の見出しに使う）
     for r in valid:
-        fn = _s(r, "ファイル")
-        if fn and fn in path_of and fn not in seen:
-            seen.add(fn)
-            targets.append((fn, r))
-    for i, (fn, r) in enumerate(targets):
+        first_row.setdefault(_s(r, "ファイル"), r)
+    links = {}
+    for i, (path, fn) in enumerate(images):   # 間違いが無い写真も含めて全部保存する
         if on_progress:
-            on_progress(i, len(targets), fn)
-        head = "_".join([x for x in (_s(r, "章"), _s(r, "節"), _s(r, "節タイトル")) if x])
-        pg = _s(r, "ページ")
+            on_progress(i, len(images), fn)
+        r = first_row.get(fn, {})
+        head = "_".join([x for x in (_s(r, "章"), _s(r, "節"), _s(r, "節タイトル")) if x]) if r else ""
+        pg = _s(r, "ページ") if r else ""
         prefix = ""
         if head:
             prefix = ("[" + head + "]").replace("/", "／") + (f"_p{pg}" if pg else "") + "_"
-        links[fn] = upload_to_drive(path_of[fn], prefix + fn, folder_id, creds)
+        links[fn] = upload_to_drive(path, prefix + fn, folder_id, creds)
+    if not valid:
+        return 0, links
     now = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     values = []
     for r in valid:
@@ -1084,7 +1158,7 @@ def record_reviewed_rows(rows, student_name, subject_name, images, creds, on_pro
             now, student_name, subject_name, _s(r, "テキスト名"),
             _s(r, "ページ"), _s(r, "章"), _s(r, "節"), _s(r, "問題番号"),
             links.get(_s(r, "ファイル"), ""), (_to_int(r.get("小問数")) or 0), _s(r, "節タイトル"),
-            "",                              # L列は未使用
+            "1" if submit_flag else "",      # L列: 提出F
             _s(r, "テストのタイトル"),         # M列
         ])
     ensure_result_header(creds)
@@ -1274,19 +1348,23 @@ def record_kakomon(rows, student_name, images, creds, on_progress=None):
     valid = [r for r in rows if _s(r.get("学校名")) or _s(r.get("科目"))]
     if not valid:
         return 0, []
-    folder_id, _ = ensure_drive_folder(student_name, creds)
+    folder_id = ensure_done_folder(student_name, creds)
     todo, seen = [], set()
     for r in valid:
         for k in _photo_nums(r):
             if k not in seen:
                 seen.add(k)
                 todo.append((k, r))
+    for k in range(1, len(images) + 1):       # どの行にも割り当てられなかった写真も保存する
+        if k not in seen:
+            seen.add(k)
+            todo.append((k, {}))
     link_of = {}
     for i, (k, r) in enumerate(todo):
         path, name = images[k - 1]
         if on_progress:
             on_progress(i, len(todo), name)
-        yr = _norm_year(r.get("年度"))
+        yr = _norm_year(r.get("年度")) if r else ""
         head = "_".join(x for x in ("過去問", _s(r.get("学校名")), _s(r.get("学部")), _s(r.get("科目")),
                                     (yr + "年度") if yr else "") if x)
         link_of[k] = upload_to_drive(path, ("[" + head + "]").replace("/", "／") + "_" + name,
@@ -1480,7 +1558,8 @@ def render_review_form(mode, imgs, student_name, subject_name, text_name, test_t
     st.caption("AIが読めなかった項目は空欄です。ここで入力・修正してから記録してください。行の追加・削除もできます。"
                + ("確認テストの『テキスト名・章・節』には、写真から読み取った**出題元**が入ります。"
                   if mode == "confirm" else "")
-               + "**問題番号が空の行は記録されません**（全問正解の写真は空行のままで構いません）。")
+               + "**問題番号が空の行はシートに記録されません**（全問正解の写真は空行のままで構いません）。"
+               "写真は正解・不正解にかかわらず、すべて生徒の「実施済答案」フォルダに保存します。")
     names = [nm for _, nm in imgs]
     df = pd.DataFrame(st.session_state["review_rows"], columns=REVIEW_COLUMNS)
     edited = st.data_editor(
@@ -1525,20 +1604,18 @@ def render_review_form(mode, imgs, student_name, subject_name, text_name, test_t
 
     try:
         n, links = record_reviewed_rows(rows_now, student_name, subject_name, imgs, creds_ui,
-                                        on_progress=_prog)
+                                        on_progress=_prog,
+                                        submit_flag=(mode == "confirm" and bool(st.session_state.get("submit_flag"))))
     except Exception as e:
         bar.empty()
         st.error(f"記録エラー: {e}")
-        return
-    if n == 0:
-        bar.empty()
-        st.warning("問題番号が入力された行がないため、記録しませんでした。")
         return
     send_notification_email_plan_b(
         f"【完了】{student_name} さんの記録（{test_title or text_name}）",
         f"種類: {KIND_LABELS[mode]}\n科目: {subject_name}\nテスト: {test_title}\nテキスト名: {text_name}\n"
         f"記録件数: {n}件\n\n" + "\n".join(f"{k}: {v}" for k, v in links.items()))
-    _finish(mode, imgs, f"✅ {n} 件を記録しました（写真 {len(links)} 枚を Drive に保存）。")
+    _finish(mode, imgs, (f"✅ {n} 件を記録しました" if n else "✅ 間違いの記録はありません（全問正解）")
+            + f"（写真 {len(links)} 枚を「{DONE_FOLDER}」に保存）。")
 
 
 def render_kakomon_form(imgs, student_name):
@@ -1661,6 +1738,9 @@ with tab_in:
         with _c4:
             text_name = st.text_input("出題元のテキスト名", key="conf_text",
                                       help="D列に記録されます。写真から読み取れなかった行にこの値が入ります。")
+        st.checkbox("📮 送付した理解度確認テストの答案として記録する（L列「提出F」に 1）", key="submit_flag",
+                    help="提出F が立った行は、テスト作成システムの手動の復習テスト作成の対象から外れます"
+                         "（LINE で回収した答案の復習は自動のループで作成されるため）。")
     else:
         st.markdown("**③ 過去問の情報**")
         st.caption("実施日・学校名・学部・科目・方式・年度・得点は写真から読み取るので、ここでの入力は不要です。"
@@ -1733,7 +1813,8 @@ with tab_res:
 
 # ================================================================== ⚙️ マスタ管理
 with tab_master:
-    _m1, _m2, _m3, _m4 = st.tabs(["📚 目次マスタ（PDFから）", "📚 目次マスタ（CSVから）", "👤 生徒", "📕 科目"])
+    _m1, _m2, _m3, _m4, _m5 = st.tabs(["📚 目次マスタ（PDFから）", "📚 目次マスタ（CSVから）", "👤 生徒", "📕 科目",
+                                       "🗂 Drive整理"])
 
     with _m1:   # ---- PDFから目次マスタを登録（逆引きアプリのPDF解析を統合） ----
         st.caption("テキストのPDFを解析して目次（章・節・ページ）を取り出し、確認・修正してから登録します。")
@@ -1839,6 +1920,37 @@ with tab_master:
             remove_list_item(creds_ui, SUBJECT_TAB, "科目", _dsub)
             st.session_state["flash"] = ("success", f"「{_dsub}」を削除しました")
             st.rerun()
+
+    with _m5:   # ---- 生徒フォルダ直下の写真を「実施済答案」へ移す（一度だけ使う整理ツール） ----
+        st.caption(f"生徒フォルダの直下に置かれている答案写真（画像ファイル）を、各生徒の「{DONE_FOLDER}」フォルダへ移動します。"
+                   "画像以外のファイルやサブフォルダは動かしません。今後の記録は最初から「実施済答案」に保存されます。")
+        if st.button("🔍 移動する写真を調べる", key="plan_move"):
+            with st.spinner("Drive を確認しています…"):
+                try:
+                    st.session_state["move_plan"] = plan_move_to_done(creds_ui)
+                except Exception as e:
+                    st.error(f"確認エラー: {e}")
+        _plan = st.session_state.get("move_plan")
+        if _plan is not None:
+            _total = sum(len(x["files"]) for x in _plan)
+            if not _total:
+                st.success("生徒フォルダの直下に答案写真はありません。整理済みです。")
+            else:
+                st.dataframe(pd.DataFrame([{"生徒": x["student"], "移動する写真": len(x["files"]),
+                                            "例": x["files"][0]["name"]} for x in _plan]),
+                             width="stretch", hide_index=True)
+                if st.button(f"📦 {_total} 枚を「{DONE_FOLDER}」へ移動する", type="primary", key="do_move"):
+                    _bar = st.progress(0.0, text="移動を開始します…")
+
+                    def _mprog(i, n, nm):
+                        _bar.progress(i / max(1, n), text=f"移動中 {i + 1}/{n}： {nm}")
+
+                    _n, _errs = move_to_done(_plan, creds_ui, on_progress=_mprog)
+                    st.session_state.pop("move_plan", None)
+                    st.session_state["flash"] = (("warning" if _errs else "success"),
+                                                 f"{_n} 枚を「{DONE_FOLDER}」へ移動しました。"
+                                                 + (f"失敗 {len(_errs)} 件: " + " / ".join(_errs[:3]) if _errs else ""))
+                    st.rerun()
 
 # ================================================================== 📜 更新履歴
 with tab_log:
