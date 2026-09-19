@@ -1213,8 +1213,6 @@ def _kakomon_prompt(n_photos):
         "・year      = 過去問の年度（例: 2024。表紙や欄外の『2024年度』『令和6年度』を読む）\n"
         "・score     = 採点後の合計得点（赤字で書かれた合計点。無ければ null）\n"
         "・max_score = 満点（配点の合計。無ければ null）\n"
-        '・wrong     = 間違えた問題（×・✕・レ点・斜線などが付いた問題。解答用紙の番号の前や□に✕が書かれた問題も含む）の大問と問題番号。'
-        '例 [{"daimon":"Ⅰ","number":"問3"}]。無ければ []\n'
         "推測で埋めないこと。読めない項目は \"\" または null にする。"
     )
 
@@ -1282,6 +1280,19 @@ def _as_date_str(v):
     return d.isoformat() if d else str(v).strip()
 
 
+def _kakomon_wrong_prompt(page_no, n_pages):
+    return (
+        f"これは生徒が解いた入試の過去問の答案（採点済み）の {page_no} 枚目の写真です（全{n_pages}枚）。\n"
+        "このページに書かれた採点記号を1問ずつ判定し、間違えた問題の大問と問題番号をすべて返してください。\n\n"
+        + _MARK_RULES +
+        "・×・✕・レ点・斜線などが付いた問題、解答用紙の番号の前や□に✕が書かれた問題は間違い。\n\n"
+        "【出力形式】JSON配列のみ（説明文は不要）。間違いが無ければ []。\n"
+        '[{"daimon":"Ⅰ","number":"問3"}]\n'
+        "・daimon = 大問（「Ⅰ」「1」「第2問」など用紙の表記のまま。無ければ \"\"）\n"
+        "・number = 問題番号（「問3」「(2)」など用紙の表記のまま）"
+    )
+
+
 def analyze_kakomon(images, api_key, default_subject="", on_progress=None, wrongs_out=None):
     """過去問の写真をまとめて読み取り、確認フォーム用の行（1行＝1回分の過去問）を返す。
        wrongs_out にリストを渡すと、間違えた問題（KK_WRONG_COLUMNS の形）をそこへ追加する。
@@ -1327,15 +1338,28 @@ def analyze_kakomon(images, api_key, default_subject="", on_progress=None, wrong
             "得点": _num(o.get("score")),
             "満点": _num(o.get("max_score")),
         })
-        if wrongs_out is not None:
-            for w in (o.get("wrong") or []):
-                if isinstance(w, dict) and (str(w.get("daimon", "") or "").strip() or str(w.get("number", "") or "").strip()):
-                    wrongs_out.append({"過去問": str(len(rows)), "大問": str(w.get("daimon", "") or "").strip(),
-                                       "問題番号": str(w.get("number", "") or "").strip(),
-                                       "分野（見出し）": "", "タイトル": ""})
     if not rows:   # 読み取れなかった → 手入力用の行を1行だけ置く
         rows.append({"写真": all_nums, "実施日": today, "学校名": "", "学部": "",
                      "科目": default_subject, "方式": "", "年度": "", "得点": None, "満点": None})
+    if wrongs_out is not None:
+        # 間違えた問題は1ページずつ読む（全ページをまとめて渡すと、最初の数ページしか読まれないことがあるため）
+        for j, f in enumerate(uploaded):
+            photo_no = idx_map[j] + 1
+            if on_progress:
+                on_progress(j, len(uploaded), f"{photo_no}枚目の間違えた問題")
+            try:
+                resp = client.models.generate_content(model=model, contents=[f, _kakomon_wrong_prompt(photo_no, len(images))])
+                arr = _extract_json_array(resp.text)
+            except Exception as e:
+                errors.append(f"{photo_no}枚目の間違えた問題: {e}")
+                continue
+            exam_no = next((i + 1 for i, r in enumerate(rows)
+                            if str(photo_no) in re.split(r"[,\s、，・]+", _half(str(r.get("写真") or "")))), 1)
+            for w in arr:
+                if isinstance(w, dict) and (str(w.get("daimon", "") or "").strip() or str(w.get("number", "") or "").strip()):
+                    wrongs_out.append({"過去問": str(exam_no), "大問": str(w.get("daimon", "") or "").strip(),
+                                       "問題番号": str(w.get("number", "") or "").strip(),
+                                       "分野（見出し）": "", "タイトル": ""})
     return rows, errors, model
 
 
@@ -1433,16 +1457,25 @@ def record_kakomon(rows, student_name, images, creds, on_progress=None, wrongs=N
 KK_WRONG_COLUMNS = ["過去問", "大問", "問題番号", "分野（見出し）", "タイトル"]
 
 
-def _classify_prompt(n_pages, targets):
+def _classify_prompt(n_pages, targets, page_no=None, prev_heading=""):
+    """page_no があれば「そのページだけ」を見て答えさせる（1ページずつ読む）。prev_heading は前のページまでの見出し。"""
     lines = "\n".join(
         f"{t['key']}: " + " ".join(x for x in (
             f"大問{t['daimon']}" if t.get("daimon") else "", str(t.get("number") or ""),
             f"（p.{t['page']}）" if t.get("page") else "",
             f"［手がかり: {t['hint']}］" if t.get("hint") else "") if x)
         for t in targets)
+    if page_no:
+        intro = (f"これは問題用紙（問題のページ）の {page_no} 枚目の画像です（全{n_pages}枚）。\n"
+                 "下の一覧のうち、このページに載っている問題だけについて、その問題の分野を次の2つで答えてください。"
+                 "このページに無い問題は出力に含めないこと。\n"
+                 + (f"このページの上部に見出しが無いときは、前のページまでの見出し「{prev_heading}」を heading に使う。\n"
+                    if prev_heading else ""))
+    else:
+        intro = (f"これは問題用紙（問題のページ）の画像です（全{n_pages}枚）。\n"
+                 "下の一覧の各問題が問題用紙のどこにあるかを探し、その問題の分野を次の2つで答えてください。\n")
     return (
-        f"これは問題用紙（問題のページ）の画像です（全{n_pages}枚）。\n"
-        "下の一覧の各問題が問題用紙のどこにあるかを探し、その問題の分野を次の2つで答えてください。\n"
+        intro +
         "・heading = 問題用紙の先頭（上部）の見出し。その問題が含まれる単元名・章名など"
         "（例:「第3章 生物の体内環境」「第2章 二次関数」「Ⅰ 長文読解」）\n"
         "・title   = 問題番号の横に書かれたタイトル。小問（(1)(2)…）に題が無いときは、その小問が属する大問の"
@@ -1472,17 +1505,32 @@ def classify_by_questions(targets, qimages, api_key, on_progress=None):
             errors.append(f"{name}: {e}")
     if not uploaded:
         return {}, errors
-    try:
-        resp = client.models.generate_content(
-            model=model, contents=uploaded + [_classify_prompt(len(uploaded), targets)])
-        arr = _extract_json_array(resp.text)
-    except Exception as e:
-        return {}, errors + [f"分野の読み取り: {e}"]
-    out = {}
-    for o in arr:
-        if isinstance(o, dict) and str(o.get("key", "")).strip():
-            out[str(o["key"]).strip()] = (str(o.get("heading", "") or "").strip(),
-                                          str(o.get("title", "") or "").strip())
+    # 1ページずつ読む（全ページをまとめて渡すと、最初の数ページしか読まれないことがあるため）。
+    # 見出しが最初のページにしか無い場合に備えて、前のページまでの見出しを引き継ぐ。見つかった問題は次から聞かない。
+    out, prev_heading = {}, ""
+    for pno, f in enumerate(uploaded, 1):
+        remaining = [t for t in targets if t["key"] not in out]
+        if not remaining:
+            break
+        try:
+            resp = client.models.generate_content(
+                model=model, contents=[f, _classify_prompt(len(uploaded), remaining, pno, prev_heading)])
+            arr = _extract_json_array(resp.text)
+        except Exception as e:
+            errors.append(f"分野の読み取り（{pno}枚目）: {e}")
+            continue
+        keys = {t["key"] for t in remaining}
+        for o in arr:
+            k = str(o.get("key", "") if isinstance(o, dict) else "").strip()
+            if k not in keys:
+                continue
+            h, ti = str(o.get("heading", "") or "").strip(), str(o.get("title", "") or "").strip()
+            if h or ti:
+                out[k] = (h or prev_heading, ti)
+                if h:
+                    prev_heading = h
+    for t in targets:
+        out.setdefault(t["key"], ("", ""))
     return out, errors
 
 
